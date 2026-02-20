@@ -1252,6 +1252,18 @@ class TimeSeries:
             idxs: Optional[np.ndarray] = np.where(ufp.is_in(self.uids, ids))[0]
         else:
             idxs = None
+        if self._dropped_series is not None:
+            drop_idxs = self._dropped_series
+            if idxs is None:
+                idxs = np.delete(np.arange(len(self.uids)), drop_idxs)
+            else:
+                idxs = np.setdiff1d(idxs, drop_idxs)
+            if idxs.size != len(self.uids):
+                warnings.warn(
+                    "Some series were dropped during preprocessing due to the transformations "
+                    "and will be excluded from predictions.",
+                    UserWarning,
+                )
         with self._maybe_subset(idxs):
             if X_df is not None:
                 if self.id_col not in X_df or self.time_col not in X_df:

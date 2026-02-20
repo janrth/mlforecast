@@ -405,10 +405,12 @@ class AutoMLForecast:
         target_col: str,
         weight_col: Optional[str],
     ) -> Dict[str, Any]:
+        base_init_params = copy.deepcopy(mlf_init_params)
+        base_fit_params = copy.deepcopy(mlf_fit_params)
         base_cv_model = MLForecast(
             models={"model": model},
             freq=self.freq,
-            **mlf_init_params,
+            **base_init_params,
         )
         base_cv = base_cv_model.cross_validation(
             df=df,
@@ -421,7 +423,7 @@ class AutoMLForecast:
             input_size=input_size,
             refit=refit,
             weight_col=weight_col,
-            **mlf_fit_params,
+            **base_fit_params,
         )
         base_cv_pd = self._to_pandas(base_cv)
         systematic_bias_ids = self._find_systematic_bias_ids(
@@ -437,10 +439,12 @@ class AutoMLForecast:
         id_mask = ufp.is_in(df[id_col], ids)
         filtered_df = ufp.filter_with_mask(df, id_mask)
 
+        intervals_init_params = copy.deepcopy(mlf_init_params)
+        intervals_fit_params = copy.deepcopy(mlf_fit_params)
         intervals_cv_model = MLForecast(
             models={"model": clone(model)},
             freq=self.freq,
-            **mlf_init_params,
+            **intervals_init_params,
         )
         intervals_cv = intervals_cv_model.cross_validation(
             df=filtered_df,
@@ -455,7 +459,7 @@ class AutoMLForecast:
             prediction_intervals=prediction_intervals,
             level=self.percentile_correction_levels_,
             weight_col=weight_col,
-            **mlf_fit_params,
+            **intervals_fit_params,
         )
         intervals_cv_pd = self._to_pandas(intervals_cv)
         best_by_id = self._select_percentiles_to_reduce_bias(
@@ -775,6 +779,7 @@ class AutoMLForecast:
                 "rmse": float(best_trial.user_attrs.get("cv_rmse", np.nan)),
                 "bias": float(best_trial.user_attrs.get("cv_bias", np.nan)),
             }
+            best_init_params = copy.deepcopy(best_config["mlf_init_params"])
             best_fit_params = copy.deepcopy(best_config["mlf_fit_params"])
             for arg in (
                 "fitted",
@@ -790,7 +795,7 @@ class AutoMLForecast:
             self.models_[name] = MLForecast(
                 models={name: best_model},
                 freq=self.freq,
-                **best_config["mlf_init_params"],
+                **best_init_params,
             )
             
             self.models_[name].fit(
@@ -811,7 +816,7 @@ class AutoMLForecast:
                     df=df,
                     model_name=name,
                     model=correction_model,
-                    mlf_init_params=best_config["mlf_init_params"],
+                    mlf_init_params=best_init_params,
                     mlf_fit_params=best_fit_params,
                     n_windows=n_windows,
                     h=h,
