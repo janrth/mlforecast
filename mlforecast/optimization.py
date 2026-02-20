@@ -19,6 +19,12 @@ _TrialToConfig = Callable[[optuna.Trial], Dict[str, Any]]
 CVSplit = Tuple[DataFrame, DataFrame, DataFrame]
 
 
+def _to_numpy(values: Any) -> np.ndarray:
+    if hasattr(values, "to_numpy"):
+        return values.to_numpy()
+    return np.asarray(values)
+
+
 def mlforecast_objective(
     df: DataFrame,
     config_fn: _TrialToConfig,
@@ -95,6 +101,8 @@ def mlforecast_objective(
         elif not isinstance(splits, list):
             splits = list(splits)
         metrics = []
+        rmse_metrics = []
+        bias_metrics = []
         for i, (_, train, valid) in enumerate(splits):
             should_fit = i == 0 or (refit > 0 and i % refit == 0)
             if should_fit:
@@ -158,10 +166,15 @@ def mlforecast_objective(
                 metric = loss(result, train_df=train, weight_col=weight_col)
             else: 
                 metric = loss(result, train_df=train)
+            errors = _to_numpy(result["model"]) - _to_numpy(result[target_col])
+            rmse_metrics.append(float(np.sqrt(np.mean(np.square(errors)))))
+            bias_metrics.append(float(np.mean(errors)))
             metrics.append(metric)
             trial.report(metric, step=i)
             if trial.should_prune():
                 raise optuna.TrialPruned()
+        trial.set_user_attr("cv_rmse", float(np.mean(rmse_metrics)))
+        trial.set_user_attr("cv_bias", float(np.mean(bias_metrics)))
         return np.mean(metrics).item()
 
     return objective

@@ -3,12 +3,14 @@ __all__ = ['lightgbm_space', 'xgboost_space', 'catboost_space', 'linear_regressi
            'AutoLinearRegression', 'AutoRidge', 'AutoLasso', 'AutoElasticNet', 'AutoRandomForest', 'AutoMLForecast']
 
 
+import copy
 import warnings
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Union
 
 import numpy as np
 import optuna
+import pandas as pd
 import utilsforecast.processing as ufp
 from sklearn.base import BaseEstimator, clone
 from sklearn.preprocessing import FunctionTransformer
@@ -284,9 +286,213 @@ class AutoMLForecast:
             models_with_names = models
         self.models = models_with_names
         self.reuse_cv_splits = reuse_cv_splits
+        self.cv_metrics_: Dict[str, Dict[str, float]] = {}
+        self.percentile_correction_: Dict[str, Dict[Any, Any]] = {}
+        self.percentile_correction_levels_ = list(range(1, 16))
+        self.percentile_correction_enabled_ = False
 
     def __repr__(self):
         return f"AutoMLForecast(models={self.models})"
+
+    @staticmethod
+    def _to_numpy(values: Any) -> np.ndarray:
+        if hasattr(values, "to_numpy"):
+            return values.to_numpy()
+        return np.asarray(values)
+
+    @staticmethod
+    def _to_pandas(df: DataFrame) -> pd.DataFrame:
+        if isinstance(df, pd.DataFrame):
+            return df.copy()
+        if hasattr(df, "to_pandas"):
+            return df.to_pandas()
+        return pd.DataFrame(df)
+
+    def _find_systematic_bias_ids(
+        self,
+        cv_df: pd.DataFrame,
+        id_col: str,
+        target_col: str,
+        model_col: str,
+    ) -> pd.DataFrame:
+        errors = cv_df[model_col] - cv_df[target_col]
+        bias_by_cutoff = (
+            cv_df.assign(_bias=errors)
+            .groupby([id_col, "cutoff"], observed=True)["_bias"]
+            .mean()
+            .reset_index()
+        )
+        id_signs = (
+            bias_by_cutoff.groupby(id_col, observed=True)["_bias"]
+            .agg(["min", "max"])
+            .reset_index()
+        )
+        underforecast_ids = id_signs.loc[id_signs["max"] < 0, [id_col]].assign(
+            direction="hi"
+        )
+        overforecast_ids = id_signs.loc[id_signs["min"] > 0, [id_col]].assign(
+            direction="lo"
+        )
+        return pd.concat([underforecast_ids, overforecast_ids], ignore_index=True)
+
+    def _select_percentiles_to_reduce_bias(
+        self,
+        cv_df: pd.DataFrame,
+        systematic_bias_ids: pd.DataFrame,
+        id_col: str,
+        target_col: str,
+        model_col: str,
+    ) -> Dict[Any, Dict[str, Any]]:
+        if systematic_bias_ids.empty:
+            return {}
+        cv_df = cv_df.merge(systematic_bias_ids, on=id_col, how="inner")
+        hi_rows = cv_df["direction"].eq("hi")
+        lo_rows = cv_df["direction"].eq("lo")
+        best_by_id: Dict[Any, Dict[str, Any]] = {}
+
+        for percentile in self.percentile_correction_levels_:
+            hi_col = f"{model_col}-hi-{percentile}"
+            lo_col = f"{model_col}-lo-{percentile}"
+            if hi_col not in cv_df.columns or lo_col not in cv_df.columns:
+                continue
+            if hi_rows.any():
+                hi_bias = (
+                    (cv_df.loc[hi_rows, hi_col] - cv_df.loc[hi_rows, target_col])
+                    .groupby(cv_df.loc[hi_rows, id_col], observed=True)
+                    .mean()
+                )
+                for uid, bias in hi_bias.items():
+                    abs_bias = abs(float(bias))
+                    current = best_by_id.get(uid)
+                    if current is None or abs_bias < current["abs_bias"]:
+                        best_by_id[uid] = {
+                            "direction": "hi",
+                            "percentile": percentile,
+                            "abs_bias": abs_bias,
+                        }
+            if lo_rows.any():
+                lo_bias = (
+                    (cv_df.loc[lo_rows, lo_col] - cv_df.loc[lo_rows, target_col])
+                    .groupby(cv_df.loc[lo_rows, id_col], observed=True)
+                    .mean()
+                )
+                for uid, bias in lo_bias.items():
+                    abs_bias = abs(float(bias))
+                    current = best_by_id.get(uid)
+                    if current is None or abs_bias < current["abs_bias"]:
+                        best_by_id[uid] = {
+                            "direction": "lo",
+                            "percentile": percentile,
+                            "abs_bias": abs_bias,
+                        }
+        return best_by_id
+
+    def _compute_percentile_correction(
+        self,
+        df: DataFrame,
+        model_name: str,
+        model: BaseEstimator,
+        mlf_init_params: Dict[str, Any],
+        mlf_fit_params: Dict[str, Any],
+        n_windows: int,
+        h: int,
+        step_size: Optional[int],
+        input_size: Optional[int],
+        refit: Union[bool, int],
+        prediction_intervals: PredictionIntervals,
+        id_col: str,
+        time_col: str,
+        target_col: str,
+        weight_col: Optional[str],
+    ) -> Dict[str, Any]:
+        base_cv_model = MLForecast(
+            models={"model": model},
+            freq=self.freq,
+            **mlf_init_params,
+        )
+        base_cv = base_cv_model.cross_validation(
+            df=df,
+            n_windows=n_windows,
+            h=h,
+            id_col=id_col,
+            time_col=time_col,
+            target_col=target_col,
+            step_size=step_size,
+            input_size=input_size,
+            refit=refit,
+            weight_col=weight_col,
+            **mlf_fit_params,
+        )
+        base_cv_pd = self._to_pandas(base_cv)
+        systematic_bias_ids = self._find_systematic_bias_ids(
+            cv_df=base_cv_pd,
+            id_col=id_col,
+            target_col=target_col,
+            model_col="model",
+        )
+        if systematic_bias_ids.empty:
+            return {"id_to_col": {}, "levels": []}
+
+        ids = systematic_bias_ids[id_col].tolist()
+        id_mask = ufp.is_in(df[id_col], ids)
+        filtered_df = ufp.filter_with_mask(df, id_mask)
+
+        intervals_cv_model = MLForecast(
+            models={"model": clone(model)},
+            freq=self.freq,
+            **mlf_init_params,
+        )
+        intervals_cv = intervals_cv_model.cross_validation(
+            df=filtered_df,
+            n_windows=n_windows,
+            h=h,
+            id_col=id_col,
+            time_col=time_col,
+            target_col=target_col,
+            step_size=step_size,
+            input_size=input_size,
+            refit=True,
+            prediction_intervals=prediction_intervals,
+            level=self.percentile_correction_levels_,
+            weight_col=weight_col,
+            **mlf_fit_params,
+        )
+        intervals_cv_pd = self._to_pandas(intervals_cv)
+        best_by_id = self._select_percentiles_to_reduce_bias(
+            cv_df=intervals_cv_pd,
+            systematic_bias_ids=systematic_bias_ids,
+            id_col=id_col,
+            target_col=target_col,
+            model_col="model",
+        )
+        if not best_by_id:
+            return {"id_to_col": {}, "levels": []}
+        id_to_col = {
+            uid: f"{model_name}-{info['direction']}-{info['percentile']}"
+            for uid, info in best_by_id.items()
+        }
+        levels = sorted({info["percentile"] for info in best_by_id.values()})
+        return {"id_to_col": id_to_col, "levels": levels}
+
+    def _apply_percentile_correction(
+        self,
+        preds: DataFrame,
+        id_col: str,
+        model_col: str,
+        id_to_col: Dict[Any, str],
+    ) -> DataFrame:
+        if not id_to_col:
+            return preds
+        ids = self._to_numpy(preds[id_col])
+        corrected_preds = self._to_numpy(preds[model_col]).copy()
+        selected_cols = np.array([id_to_col.get(uid, "") for uid in ids], dtype=object)
+        for col in np.unique(selected_cols):
+            if not col or col not in preds.columns:
+                continue
+            mask = selected_cols == col
+            percentile_values = self._to_numpy(preds[col])
+            corrected_preds[mask] = percentile_values[mask]
+        return ufp.assign_columns(preds, model_col, corrected_preds)
 
     def _seasonality_based_config(
         self,
@@ -448,7 +654,8 @@ class AutoMLForecast:
         optimize_kwargs: Optional[Dict[str, Any]] = None,
         fitted: bool = False,
         prediction_intervals: Optional[PredictionIntervals] = None,
-        weight_col: Optional[np.ndarray] = None
+        weight_col: Optional[str] = None,
+        percentile_correction: bool = False,
     ) -> "AutoMLForecast":
         """Carry out the optimization process.
         Each model is optimized independently and the best one is trained on all data
@@ -476,6 +683,9 @@ class AutoMLForecast:
                 Defaults to None.
             fitted (bool): Whether to compute the fitted values when retraining the best model. Defaults to False.
             prediction_intervals: Configuration to calibrate prediction intervals when retraining the best model.
+            weight_col (str, optional): Column that contains sample weights. Defaults to None.
+            percentile_correction (bool): Whether to correct model predictions using conformal percentiles (1..15)
+                for ids with systematic CV bias. Defaults to False.
 
         Returns:
             (AutoMLForecast): object with best models and optimization results
@@ -508,6 +718,13 @@ class AutoMLForecast:
             optimize_kwargs = {}
         self.results_ = {}
         self.models_ = {}
+        self.cv_metrics_ = {}
+        self.percentile_correction_ = {}
+        self.percentile_correction_enabled_ = percentile_correction
+        if percentile_correction and prediction_intervals is None:
+            raise ValueError(
+                "`prediction_intervals` must be provided when `percentile_correction=True`."
+            )
         cv_splits = None
         if self.reuse_cv_splits:
             cv_splits = list(
@@ -552,15 +769,22 @@ class AutoMLForecast:
             study = optuna.create_study(direction="minimize", **study_kwargs)
             study.optimize(objective, n_trials=num_samples, **optimize_kwargs)
             self.results_[name] = study
-            best_config = study.best_trial.user_attrs["config"]
+            best_trial = study.best_trial
+            best_config = best_trial.user_attrs["config"]
+            self.cv_metrics_[name] = {
+                "rmse": float(best_trial.user_attrs.get("cv_rmse", np.nan)),
+                "bias": float(best_trial.user_attrs.get("cv_bias", np.nan)),
+            }
+            best_fit_params = copy.deepcopy(best_config["mlf_fit_params"])
             for arg in (
                 "fitted",
                 "prediction_intervals",
                 "id_col",
                 "time_col",
                 "target_col",
+                "weight_col",
             ):
-                best_config["mlf_fit_params"].pop(arg, None)
+                best_fit_params.pop(arg, None)
             best_model = clone(auto_model.model)
             best_model.set_params(**best_config["model_params"])
             self.models_[name] = MLForecast(
@@ -577,8 +801,31 @@ class AutoMLForecast:
                 time_col=time_col,
                 target_col=target_col,
                 weight_col=weight_col,
-                **best_config["mlf_fit_params"],
+                **best_fit_params,
             )
+            if percentile_correction:
+                assert prediction_intervals is not None
+                correction_model = clone(auto_model.model)
+                correction_model.set_params(**best_config["model_params"])
+                self.percentile_correction_[name] = self._compute_percentile_correction(
+                    df=df,
+                    model_name=name,
+                    model=correction_model,
+                    mlf_init_params=best_config["mlf_init_params"],
+                    mlf_fit_params=best_fit_params,
+                    n_windows=n_windows,
+                    h=h,
+                    step_size=step_size,
+                    input_size=input_size,
+                    refit=refit,
+                    prediction_intervals=prediction_intervals,
+                    id_col=id_col,
+                    time_col=time_col,
+                    target_col=target_col,
+                    weight_col=weight_col,
+                )
+            else:
+                self.percentile_correction_[name] = {"id_to_col": {}, "levels": []}
         return self
 
     def predict(
@@ -601,7 +848,31 @@ class AutoMLForecast:
         """
         all_preds = None
         for name, model in self.models_.items():
-            preds = model.predict(h=h, X_df=X_df, level=level)
+            correction = self.percentile_correction_.get(name, {})
+            correction_levels = correction.get("levels", [])
+            predict_levels = level
+            if self.percentile_correction_enabled_ and correction_levels:
+                if level is None:
+                    predict_levels = correction_levels
+                else:
+                    predict_levels = sorted(set(level) | set(correction_levels))
+            preds = model.predict(h=h, X_df=X_df, level=predict_levels)
+            if self.percentile_correction_enabled_:
+                preds = self._apply_percentile_correction(
+                    preds=preds,
+                    id_col=model.ts.id_col,
+                    model_col=name,
+                    id_to_col=correction.get("id_to_col", {}),
+                )
+                extra_levels = set(correction_levels)
+                if level is not None:
+                    extra_levels -= set(level)
+                drop_cols = []
+                for lvl in sorted(extra_levels):
+                    drop_cols.extend([f"{name}-lo-{lvl}", f"{name}-hi-{lvl}"])
+                drop_cols = [c for c in drop_cols if c in preds.columns]
+                if drop_cols:
+                    preds = ufp.drop_columns(preds, drop_cols)
             if all_preds is None:
                 all_preds = preds
             else:

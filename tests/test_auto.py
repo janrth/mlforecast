@@ -6,6 +6,7 @@ import polars as pl
 import pytest
 from datasetsforecast.m4 import M4, M4Info
 from sklearn.compose import ColumnTransformer
+from sklearn.dummy import DummyRegressor
 from sklearn.linear_model import Ridge
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import OneHotEncoder
@@ -314,3 +315,97 @@ def test_reuse_cv_splits_same_predictions(weekly_data):
 
     assert preds_a.columns.tolist() == preds_b.columns.tolist()
     assert (preds_a["ridge"].to_numpy() == preds_b["ridge"].to_numpy()).all()
+
+
+def _positive_series_df(n_ids: int = 3, n_timesteps: int = 40) -> pd.DataFrame:
+    rows = []
+    for i in range(n_ids):
+        uid = f"id_{i}"
+        for t in range(n_timesteps):
+            rows.append(
+                {
+                    "unique_id": uid,
+                    "ds": t,
+                    "y": float(10 + i + t),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def _dummy_automl() -> AutoMLForecast:
+    return AutoMLForecast(
+        models={
+            "dummy": AutoModel(
+                DummyRegressor(),
+                lambda trial: {"strategy": "constant", "constant": 0.0},
+            )
+        },
+        freq=1,
+        init_config=lambda trial: {"lags": [1]},  # noqa: ARG005
+    )
+
+
+def test_automl_stores_rmse_and_bias_metrics():
+    df = _positive_series_df()
+    h = 3
+    model = _dummy_automl()
+
+    model.fit(
+        df=df,
+        n_windows=2,
+        h=h,
+        num_samples=1,
+    )
+
+    metrics = model.cv_metrics_["dummy"]
+    assert set(metrics) == {"rmse", "bias"}
+    assert np.isfinite(metrics["rmse"])
+    assert np.isfinite(metrics["bias"])
+
+
+def test_percentile_correction_requires_prediction_intervals():
+    df = _positive_series_df()
+    h = 3
+    model = _dummy_automl()
+
+    assert_raises_with_message(
+        lambda: model.fit(
+            df=df,
+            n_windows=2,
+            h=h,
+            num_samples=1,
+            percentile_correction=True,
+        ),
+        "`prediction_intervals` must be provided when `percentile_correction=True`.",
+    )
+
+
+def test_percentile_correction_for_systematic_bias():
+    df = _positive_series_df()
+    h = 3
+    common_fit_kwargs = dict(
+        df=df,
+        n_windows=2,
+        h=h,
+        num_samples=1,
+        prediction_intervals=PredictionIntervals(n_windows=2, h=h),
+    )
+
+    base_model = _dummy_automl().fit(**common_fit_kwargs)
+    corrected_model = _dummy_automl().fit(
+        **common_fit_kwargs,
+        percentile_correction=True,
+    )
+
+    base_preds = base_model.predict(h=h)
+    corrected_preds = corrected_model.predict(h=h)
+    merged = base_preds.merge(
+        corrected_preds,
+        on=["unique_id", "ds"],
+        suffixes=("_base", "_corrected"),
+    )
+    correction_info = corrected_model.percentile_correction_["dummy"]
+
+    assert correction_info["id_to_col"]
+    assert all("-hi-" in col for col in correction_info["id_to_col"].values())
+    assert (merged["dummy_corrected"] >= merged["dummy_base"]).all()
