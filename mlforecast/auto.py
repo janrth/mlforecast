@@ -4,6 +4,7 @@ __all__ = ['lightgbm_space', 'xgboost_space', 'catboost_space', 'linear_regressi
 
 
 import copy
+import inspect
 import warnings
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Union
@@ -12,6 +13,7 @@ import numpy as np
 import optuna
 import pandas as pd
 import utilsforecast.processing as ufp
+import utilsforecast.losses as ufl
 from sklearn.base import BaseEstimator, clone
 from sklearn.preprocessing import FunctionTransformer
 from utilsforecast.compat import DataFrame
@@ -387,6 +389,70 @@ class AutoMLForecast:
                         }
         return best_by_id
 
+    def _select_percentiles_by_metric(
+        self,
+        cv_df: pd.DataFrame,
+        id_col: str,
+        target_col: str,
+        model_col: str,
+        metric: str,
+        metric_kwargs: Optional[Dict[str, Any]],
+        cutoff_col: str,
+    ) -> Dict[Any, Dict[str, Any]]:
+        metric_key = metric.lower()
+        if metric_key == "abs_bias":
+            metric_fn = ufl.bias
+        else:
+            metric_fn = getattr(ufl, metric_key, None)
+        if metric_fn is None:
+            raise ValueError(
+                "percentile_correction_metric must be a loss from utilsforecast.losses "
+                "or 'abs_bias'."
+            )
+        best_by_id: Dict[Any, Dict[str, Any]] = {}
+        metric_kwargs = metric_kwargs or {}
+        metric_params = set(inspect.signature(metric_fn).parameters)
+        df_for_metric = cv_df
+        if cutoff_col in cv_df.columns:
+            df_for_metric = cv_df.drop(columns=[cutoff_col])
+
+        cols: List[str] = []
+        col_meta: Dict[str, Dict[str, Any]] = {}
+        for percentile in self.percentile_correction_levels_:
+            for side in ("lo", "hi"):
+                col = f"{model_col}-{side}-{percentile}"
+                if col in cv_df.columns:
+                    cols.append(col)
+                    col_meta[col] = {"side": side, "percentile": percentile}
+        if not cols:
+            return {}
+
+        call_kwargs = {"df": df_for_metric, "models": cols}
+        if "id_col" in metric_params:
+            call_kwargs["id_col"] = id_col
+        if "target_col" in metric_params:
+            call_kwargs["target_col"] = target_col
+        for key, value in metric_kwargs.items():
+            if key in metric_params:
+                call_kwargs[key] = value
+        metrics_df = metric_fn(**call_kwargs)
+        if metric_key == "abs_bias":
+            metrics_df[cols] = metrics_df[cols].abs()
+
+        metrics_df = metrics_df.set_index(id_col)
+        min_col = metrics_df[cols].idxmin(axis=1)
+        min_val = metrics_df[cols].min(axis=1)
+        for uid, col in min_col.items():
+            meta = col_meta.get(col)
+            if meta is None:
+                continue
+            best_by_id[uid] = {
+                "side": meta["side"],
+                "percentile": meta["percentile"],
+                "metric": float(min_val.loc[uid]),
+            }
+        return best_by_id
+
     def _compute_percentile_correction(
         self,
         df: DataFrame,
@@ -404,7 +470,58 @@ class AutoMLForecast:
         time_col: str,
         target_col: str,
         weight_col: Optional[str],
+        correction_metric: str,
+        correction_mode: str,
+        correction_metric_kwargs: Optional[Dict[str, Any]],
+        cutoff_col: str,
     ) -> Dict[str, Any]:
+        if not self.percentile_correction_levels_:
+            return {"id_to_col": {}, "levels": []}
+        mode = correction_mode.lower()
+        metric_key = correction_metric.lower()
+
+        if mode == "metric":
+            intervals_init_params = copy.deepcopy(mlf_init_params)
+            intervals_fit_params = copy.deepcopy(mlf_fit_params)
+            intervals_cv_model = MLForecast(
+                models={"model": clone(model)},
+                freq=self.freq,
+                **intervals_init_params,
+            )
+            intervals_cv = intervals_cv_model.cross_validation(
+                df=df,
+                n_windows=n_windows,
+                h=h,
+                id_col=id_col,
+                time_col=time_col,
+                target_col=target_col,
+                step_size=step_size,
+                input_size=input_size,
+                refit=True,
+                prediction_intervals=prediction_intervals,
+                level=self.percentile_correction_levels_,
+                weight_col=weight_col,
+                **intervals_fit_params,
+            )
+            intervals_cv_pd = self._to_pandas(intervals_cv)
+            best_by_id = self._select_percentiles_by_metric(
+                cv_df=intervals_cv_pd,
+                id_col=id_col,
+                target_col=target_col,
+                model_col="model",
+                metric=metric_key,
+                metric_kwargs=correction_metric_kwargs,
+                cutoff_col=cutoff_col,
+            )
+            if not best_by_id:
+                return {"id_to_col": {}, "levels": []}
+            id_to_col = {
+                uid: f"{model_name}-{info['side']}-{info['percentile']}"
+                for uid, info in best_by_id.items()
+            }
+            levels = sorted({info["percentile"] for info in best_by_id.values()})
+            return {"id_to_col": id_to_col, "levels": levels}
+
         base_init_params = copy.deepcopy(mlf_init_params)
         base_fit_params = copy.deepcopy(mlf_fit_params)
         base_cv_model = MLForecast(
@@ -660,6 +777,11 @@ class AutoMLForecast:
         prediction_intervals: Optional[PredictionIntervals] = None,
         weight_col: Optional[str] = None,
         percentile_correction: bool = False,
+        percentile_correction_mode: str = "bias",
+        percentile_correction_metric: str = "bias",
+        percentile_correction_levels: Optional[List[Union[int, float]]] = None,
+        percentile_correction_metric_kwargs: Optional[Dict[str, Any]] = None,
+        compute_corrected_cv_metrics: bool = False,
     ) -> "AutoMLForecast":
         """Carry out the optimization process.
         Each model is optimized independently and the best one is trained on all data
@@ -690,6 +812,17 @@ class AutoMLForecast:
             weight_col (str, optional): Column that contains sample weights. Defaults to None.
             percentile_correction (bool): Whether to correct model predictions using conformal percentiles (1..15)
                 for ids with systematic CV bias. Defaults to False.
+            percentile_correction_mode (str): Selection mode for percentile correction. Use "bias" to
+                correct only ids with systematic bias, or "metric" to select the percentile that
+                minimizes a metric per id. Defaults to "bias".
+            percentile_correction_metric (str): Metric used when `percentile_correction_mode="metric"`.
+                One of "rmse", "mse", "mae", "bias", "abs_bias". Defaults to "bias".
+            percentile_correction_levels (list, optional): Percentile levels to evaluate for correction.
+                Defaults to `range(1, 16)` if not provided.
+            percentile_correction_metric_kwargs (dict, optional): Extra keyword arguments passed to the
+                selected utilsforecast loss function (e.g., seasonality for MASE). Defaults to None.
+            compute_corrected_cv_metrics (bool): When using percentile correction, compute CV metrics
+                after applying the correction mapping. Defaults to False.
 
         Returns:
             (AutoMLForecast): object with best models and optimization results
@@ -723,8 +856,11 @@ class AutoMLForecast:
         self.results_ = {}
         self.models_ = {}
         self.cv_metrics_ = {}
+        self.cv_metrics_corrected_ = {}
         self.percentile_correction_ = {}
         self.percentile_correction_enabled_ = percentile_correction
+        if percentile_correction_levels is not None:
+            self.percentile_correction_levels_ = list(percentile_correction_levels)
         if percentile_correction and prediction_intervals is None:
             raise ValueError(
                 "`prediction_intervals` must be provided when `percentile_correction=True`."
@@ -828,7 +964,62 @@ class AutoMLForecast:
                     time_col=time_col,
                     target_col=target_col,
                     weight_col=weight_col,
+                    correction_metric=percentile_correction_metric,
+                    correction_mode=percentile_correction_mode,
+                    correction_metric_kwargs=percentile_correction_metric_kwargs,
+                    cutoff_col="cutoff",
                 )
+                if compute_corrected_cv_metrics:
+                    correction = self.percentile_correction_[name]
+                    if not correction.get("id_to_col") or not correction.get("levels"):
+                        self.cv_metrics_corrected_[name] = self.cv_metrics_[name]
+                    else:
+                        cv_fit_params = {
+                            k: v
+                            for k, v in best_fit_params.items()
+                            if k
+                            in {
+                                "static_features",
+                                "dropna",
+                                "keep_last_n",
+                                "max_horizon",
+                                "horizons",
+                                "fitted",
+                                "as_numpy",
+                            }
+                        }
+                        cv_model = MLForecast(
+                            models={name: clone(best_model)},
+                            freq=self.freq,
+                            **best_init_params,
+                        )
+                        cv_refit = refit if refit not in (False, 0) else True
+                        cv_df = cv_model.cross_validation(
+                            df=df,
+                            n_windows=n_windows,
+                            h=h,
+                            id_col=id_col,
+                            time_col=time_col,
+                            target_col=target_col,
+                            step_size=step_size,
+                            input_size=input_size,
+                            refit=cv_refit,
+                            prediction_intervals=prediction_intervals,
+                            level=correction["levels"],
+                            weight_col=weight_col,
+                            **cv_fit_params,
+                        )
+                        cv_df = self._apply_percentile_correction(
+                            preds=cv_df,
+                            id_col=id_col,
+                            model_col=name,
+                            id_to_col=correction["id_to_col"],
+                        )
+                        errors = cv_df[name] - cv_df[target_col]
+                        self.cv_metrics_corrected_[name] = {
+                            "rmse": float(np.sqrt(np.mean(np.square(errors)))),
+                            "bias": float(np.mean(errors)),
+                        }
             else:
                 self.percentile_correction_[name] = {"id_to_col": {}, "levels": []}
         return self

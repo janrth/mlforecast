@@ -1252,8 +1252,9 @@ class TimeSeries:
             idxs: Optional[np.ndarray] = np.where(ufp.is_in(self.uids, ids))[0]
         else:
             idxs = None
-        if self._dropped_series is not None:
-            drop_idxs = self._dropped_series
+        dropped = getattr(self, "_dropped_series", None)
+        if dropped is not None:
+            drop_idxs = dropped
             if idxs is None:
                 idxs = np.delete(np.arange(len(self.uids)), drop_idxs)
             else:
