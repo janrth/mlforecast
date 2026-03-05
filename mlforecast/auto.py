@@ -7,7 +7,7 @@ import copy
 import inspect
 import warnings
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import optuna
@@ -16,7 +16,7 @@ import utilsforecast.processing as ufp
 import utilsforecast.losses as ufl
 from sklearn.base import BaseEstimator, clone
 from sklearn.preprocessing import FunctionTransformer
-from utilsforecast.compat import DataFrame
+from utilsforecast.compat import DataFrame, pl
 from utilsforecast.losses import smape
 from utilsforecast.validation import validate_freq
 
@@ -453,6 +453,116 @@ class AutoMLForecast:
             }
         return best_by_id
 
+    def _add_horizon_column(
+        self,
+        df: DataFrame,
+        id_col: str,
+        time_col: str,
+        cutoff_col: Optional[str] = None,
+    ) -> DataFrame:
+        if isinstance(df, pd.DataFrame):
+            sort_cols = [id_col]
+            if cutoff_col and cutoff_col in df.columns:
+                sort_cols.append(cutoff_col)
+            sort_cols.append(time_col)
+            df = df.sort_values(sort_cols)
+            if cutoff_col and cutoff_col in df.columns:
+                df["_horizon"] = (
+                    df.groupby([id_col, cutoff_col], observed=True).cumcount() + 1
+                )
+            else:
+                df["_horizon"] = df.groupby(id_col, observed=True).cumcount() + 1
+            return df
+        # polars
+        group_cols = [id_col]
+        if cutoff_col and cutoff_col in df.columns:
+            group_cols.append(cutoff_col)
+        df = df.sort(by=group_cols + [time_col])
+        df = df.with_columns(
+            (pl.col(time_col).cum_count().over(group_cols) + 1).alias("_horizon")
+        )
+        return df
+
+    def _select_percentiles_by_metric_per_horizon(
+        self,
+        cv_df: pd.DataFrame,
+        id_col: str,
+        target_col: str,
+        model_col: str,
+        metric: str,
+        metric_kwargs: Optional[Dict[str, Any]],
+        cutoff_col: str,
+        time_col: str,
+    ) -> Dict[Tuple[Any, int], Dict[str, Any]]:
+        metric_key = metric.lower()
+        if metric_key == "abs_bias":
+            metric_fn = ufl.bias
+        else:
+            metric_fn = getattr(ufl, metric_key, None)
+        if metric_fn is None:
+            raise ValueError(
+                "percentile_correction_metric must be a loss from utilsforecast.losses "
+                "or 'abs_bias'."
+            )
+        metric_kwargs = metric_kwargs or {}
+        metric_params = set(inspect.signature(metric_fn).parameters)
+
+        df_for_metric = self._add_horizon_column(
+            cv_df, id_col=id_col, time_col=time_col, cutoff_col=cutoff_col
+        )
+        if cutoff_col in df_for_metric.columns:
+            df_for_metric = df_for_metric.drop(columns=[cutoff_col])
+        df_for_metric["_id_step"] = list(
+            zip(df_for_metric[id_col].to_numpy(), df_for_metric["_horizon"].to_numpy())
+        )
+
+        cols: List[str] = []
+        col_meta: Dict[str, Dict[str, Any]] = {}
+        for percentile in self.percentile_correction_levels_:
+            for side in ("lo", "hi"):
+                col = f"{model_col}-{side}-{percentile}"
+                if col in cv_df.columns:
+                    cols.append(col)
+                    col_meta[col] = {"side": side, "percentile": percentile}
+        if not cols:
+            return {}
+
+        call_kwargs = {"df": df_for_metric, "models": cols}
+        if "id_col" in metric_params:
+            call_kwargs["id_col"] = "_id_step"
+        if "target_col" in metric_params:
+            call_kwargs["target_col"] = target_col
+        for key, value in metric_kwargs.items():
+            if key in metric_params:
+                call_kwargs[key] = value
+        metrics_df = metric_fn(**call_kwargs)
+        if not isinstance(metrics_df, pd.DataFrame):
+            metrics_df = pd.DataFrame(metrics_df)
+        if "_id_step" not in metrics_df.columns:
+            if metrics_df.index.name == "_id_step":
+                metrics_df = metrics_df.reset_index()
+        if "_id_step" not in metrics_df.columns:
+            raise ValueError("Expected _id_step column in metric output.")
+        if metric_key == "abs_bias":
+            metrics_df[cols] = metrics_df[cols].abs()
+
+        metrics_df = metrics_df.set_index("_id_step")
+        metric_vals = metrics_df[cols]
+        min_col = metric_vals.idxmin(axis=1)
+        min_val = metric_vals.min(axis=1)
+        best_by_id: Dict[Tuple[Any, int], Dict[str, Any]] = {}
+        for id_step, col in min_col.items():
+            meta = col_meta.get(col)
+            if meta is None:
+                continue
+            uid, step = id_step
+            best_by_id[(uid, int(step))] = {
+                "side": meta["side"],
+                "percentile": meta["percentile"],
+                "metric": float(min_val.loc[id_step]),
+            }
+        return best_by_id
+
     def _compute_percentile_correction(
         self,
         df: DataFrame,
@@ -474,12 +584,16 @@ class AutoMLForecast:
         correction_mode: str,
         correction_metric_kwargs: Optional[Dict[str, Any]],
         cutoff_col: str,
+        strict_bias: bool,
+        per_horizon: bool,
     ) -> Dict[str, Any]:
         if not self.percentile_correction_levels_:
             return {"id_to_col": {}, "levels": []}
         mode = correction_mode.lower()
         metric_key = correction_metric.lower()
 
+        if per_horizon and mode != "metric":
+            raise ValueError("per_horizon correction is only supported in metric mode.")
         if mode == "metric":
             intervals_init_params = copy.deepcopy(mlf_init_params)
             intervals_fit_params = copy.deepcopy(mlf_fit_params)
@@ -504,23 +618,35 @@ class AutoMLForecast:
                 **intervals_fit_params,
             )
             intervals_cv_pd = self._to_pandas(intervals_cv)
-            best_by_id = self._select_percentiles_by_metric(
-                cv_df=intervals_cv_pd,
-                id_col=id_col,
-                target_col=target_col,
-                model_col="model",
-                metric=metric_key,
-                metric_kwargs=correction_metric_kwargs,
-                cutoff_col=cutoff_col,
-            )
+            if per_horizon:
+                best_by_id = self._select_percentiles_by_metric_per_horizon(
+                    cv_df=intervals_cv_pd,
+                    id_col=id_col,
+                    target_col=target_col,
+                    model_col="model",
+                    metric=metric_key,
+                    metric_kwargs=correction_metric_kwargs,
+                    cutoff_col=cutoff_col,
+                    time_col=time_col,
+                )
+            else:
+                best_by_id = self._select_percentiles_by_metric(
+                    cv_df=intervals_cv_pd,
+                    id_col=id_col,
+                    target_col=target_col,
+                    model_col="model",
+                    metric=metric_key,
+                    metric_kwargs=correction_metric_kwargs,
+                    cutoff_col=cutoff_col,
+                )
             if not best_by_id:
                 return {"id_to_col": {}, "levels": []}
             id_to_col = {
-                uid: f"{model_name}-{info['side']}-{info['percentile']}"
-                for uid, info in best_by_id.items()
+                key: f"{model_name}-{info['side']}-{info['percentile']}"
+                for key, info in best_by_id.items()
             }
             levels = sorted({info["percentile"] for info in best_by_id.values()})
-            return {"id_to_col": id_to_col, "levels": levels}
+            return {"id_to_col": id_to_col, "levels": levels, "by_horizon": per_horizon}
 
         base_init_params = copy.deepcopy(mlf_init_params)
         base_fit_params = copy.deepcopy(mlf_fit_params)
@@ -543,12 +669,27 @@ class AutoMLForecast:
             **base_fit_params,
         )
         base_cv_pd = self._to_pandas(base_cv)
-        systematic_bias_ids = self._find_systematic_bias_ids(
-            cv_df=base_cv_pd,
-            id_col=id_col,
-            target_col=target_col,
-            model_col="model",
-        )
+        if strict_bias:
+            systematic_bias_ids = self._find_systematic_bias_ids(
+                cv_df=base_cv_pd,
+                id_col=id_col,
+                target_col=target_col,
+                model_col="model",
+            )
+        else:
+            bias = (
+                base_cv_pd["model"] - base_cv_pd[target_col]
+            ).groupby(base_cv_pd[id_col], observed=True).mean()
+            bias = bias.rename("bias")
+            systematic_bias_ids = (
+                bias.reset_index()
+                .assign(
+                    direction=lambda df: np.where(df["bias"] < 0, "hi", "lo")
+                )
+            )
+            systematic_bias_ids = systematic_bias_ids[systematic_bias_ids["bias"] != 0][
+                [id_col, "direction"]
+            ]
         if systematic_bias_ids.empty:
             return {"id_to_col": {}, "levels": []}
 
@@ -601,19 +742,40 @@ class AutoMLForecast:
         id_col: str,
         model_col: str,
         id_to_col: Dict[Any, str],
+        time_col: Optional[str] = None,
+        cutoff_col: Optional[str] = None,
     ) -> DataFrame:
         if not id_to_col:
             return preds
-        ids = self._to_numpy(preds[id_col])
+        by_horizon = any(isinstance(k, tuple) and len(k) == 2 for k in id_to_col.keys())
+        if by_horizon:
+            if time_col is None:
+                raise ValueError("time_col is required for per-horizon correction.")
+            preds = self._add_horizon_column(
+                preds, id_col=id_col, time_col=time_col, cutoff_col=cutoff_col
+            )
+            ids = self._to_numpy(preds[id_col])
+            steps = self._to_numpy(preds["_horizon"]).astype(int)
+            keys = np.array([(uid, step) for uid, step in zip(ids, steps)], dtype=object)
+            selected_cols = np.array(
+                [id_to_col.get(key, "") for key in keys], dtype=object
+            )
+        else:
+            ids = self._to_numpy(preds[id_col])
+            selected_cols = np.array(
+                [id_to_col.get(uid, "") for uid in ids], dtype=object
+            )
         corrected_preds = self._to_numpy(preds[model_col]).copy()
-        selected_cols = np.array([id_to_col.get(uid, "") for uid in ids], dtype=object)
         for col in np.unique(selected_cols):
             if not col or col not in preds.columns:
                 continue
             mask = selected_cols == col
             percentile_values = self._to_numpy(preds[col])
             corrected_preds[mask] = percentile_values[mask]
-        return ufp.assign_columns(preds, model_col, corrected_preds)
+        preds = ufp.assign_columns(preds, model_col, corrected_preds)
+        if by_horizon and "_horizon" in preds.columns:
+            preds = ufp.drop_columns(preds, "_horizon")
+        return preds
 
     def _seasonality_based_config(
         self,
@@ -781,6 +943,8 @@ class AutoMLForecast:
         percentile_correction_metric: str = "bias",
         percentile_correction_levels: Optional[List[Union[int, float]]] = None,
         percentile_correction_metric_kwargs: Optional[Dict[str, Any]] = None,
+        percentile_correction_strict_bias: bool = True,
+        percentile_correction_per_horizon: bool = False,
         compute_corrected_cv_metrics: bool = False,
     ) -> "AutoMLForecast":
         """Carry out the optimization process.
@@ -821,6 +985,11 @@ class AutoMLForecast:
                 Defaults to `range(1, 16)` if not provided.
             percentile_correction_metric_kwargs (dict, optional): Extra keyword arguments passed to the
                 selected utilsforecast loss function (e.g., seasonality for MASE). Defaults to None.
+            percentile_correction_strict_bias (bool): When using bias-based correction, require all CV
+                bias values for an id to share the same sign before correcting. If False, use the mean
+                bias sign across all CV rows to set direction. Defaults to True.
+            percentile_correction_per_horizon (bool): When using metric-based correction, select the
+                best percentile per id and per horizon step (1..h). Defaults to False.
             compute_corrected_cv_metrics (bool): When using percentile correction, compute CV metrics
                 after applying the correction mapping. Defaults to False.
 
@@ -968,6 +1137,8 @@ class AutoMLForecast:
                     correction_mode=percentile_correction_mode,
                     correction_metric_kwargs=percentile_correction_metric_kwargs,
                     cutoff_col="cutoff",
+                    strict_bias=percentile_correction_strict_bias,
+                    per_horizon=percentile_correction_per_horizon,
                 )
                 if compute_corrected_cv_metrics:
                     correction = self.percentile_correction_[name]
@@ -1014,6 +1185,8 @@ class AutoMLForecast:
                             id_col=id_col,
                             model_col=name,
                             id_to_col=correction["id_to_col"],
+                            time_col=time_col,
+                            cutoff_col="cutoff",
                         )
                         errors = cv_df[name] - cv_df[target_col]
                         self.cv_metrics_corrected_[name] = {
@@ -1059,6 +1232,7 @@ class AutoMLForecast:
                     id_col=model.ts.id_col,
                     model_col=name,
                     id_to_col=correction.get("id_to_col", {}),
+                    time_col=model.ts.time_col,
                 )
                 extra_levels = set(correction_levels)
                 if level is not None:
