@@ -39,6 +39,86 @@ warnings.simplefilter('ignore', UserWarning)
 def test_conformal_method():
     with pytest.raises(ValueError):
         _get_conformal_method('my_method')
+    assert _get_conformal_method('global') is not None
+
+
+def test_conformal_shape_mismatch_error():
+    conformal_error = _get_conformal_method("conformal_error")
+    fcst_df = pd.DataFrame(
+        {
+            "unique_id": ["id_0", "id_1"],
+            "ds": pd.to_datetime(["2020-01-01", "2020-01-01"]),
+            "model": [1.0, 2.0],
+        }
+    )
+    cs_df = pd.DataFrame(
+        {
+            "unique_id": ["id_0", "id_1", "id_2"],
+            "ds": pd.to_datetime(["2019-12-31", "2019-12-31", "2019-12-31"]),
+            "cutoff": pd.to_datetime(["2019-12-30", "2019-12-30", "2019-12-30"]),
+            "model": [0.1, 0.2, 0.3],
+        }
+    )
+    with pytest.raises(ValueError, match="calibrated on 3 series but forecasting 2 series"):
+        conformal_error(
+            fcst_df=fcst_df,
+            cs_df=cs_df,
+            model_names=["model"],
+            level=[80],
+            cs_n_windows=1,
+            cs_h=1,
+            n_series=2,
+            horizon=1,
+        )
+
+
+def test_prediction_intervals_global_method_with_ids():
+    horizon = 7
+    df = generate_daily_series(
+        n_series=6,
+        min_length=80,
+        max_length=80,
+        equal_ends=True,
+        seed=0,
+    )
+    valid = df.groupby("unique_id", observed=True).tail(horizon)
+    train = df.drop(valid.index)
+    ids = sorted(train["unique_id"].unique().tolist())[:3]
+
+    fcst = MLForecast(
+        models=lgb.LGBMRegressor(random_state=0, verbosity=-1),
+        freq="D",
+        lags=[1, 7],
+        num_threads=1,
+    )
+    fcst.fit(
+        train,
+        static_features=[],
+        prediction_intervals=PredictionIntervals(
+            n_windows=2, h=horizon, method="global"
+        ),
+    )
+    preds = fcst.predict(horizon, level=[80], ids=ids)
+    assert "LGBMRegressor-lo-80" in preds.columns
+    assert "LGBMRegressor-hi-80" in preds.columns
+
+    point_preds = fcst.predict(horizon, ids=ids)
+    manual = _get_conformal_method("conformal_distribution")(
+        point_preds,
+        fcst._cs_df,
+        model_names=list(fcst.models.keys()),
+        level=[80],
+        cs_h=fcst.prediction_intervals.h,
+        cs_n_windows=fcst.prediction_intervals.n_windows,
+        n_series=len(ids),
+        horizon=horizon,
+        use_pooled=True,
+    )
+    pd.testing.assert_frame_equal(
+        preds.reset_index(drop=True),
+        manual.reset_index(drop=True),
+    )
+
 
 @pytest.fixture
 def setup_forecast_data():
@@ -166,6 +246,189 @@ def test_new_df_argument(fitted_fcst, setup_forecast_data, predictions):
         fitted_fcst.predict(horizon, new_df=train),
         predictions
     )
+
+
+def test_transfer_learning_intervals_pooled_for_new_items():
+    horizon = 7
+    base = generate_daily_series(
+        n_series=4,
+        min_length=80,
+        max_length=80,
+        equal_ends=True,
+        seed=0,
+    )
+    transfer = generate_daily_series(
+        n_series=6,
+        min_length=80,
+        max_length=80,
+        equal_ends=True,
+        seed=1,
+    )
+    transfer_valid = transfer.groupby("unique_id", observed=True).tail(horizon)
+    transfer_train = transfer.drop(transfer_valid.index)
+
+    fcst = MLForecast(
+        models=LinearRegression(),
+        freq="D",
+        lags=[1, 7],
+        num_threads=1,
+    )
+    fcst.fit(
+        base,
+        static_features=[],
+        prediction_intervals=PredictionIntervals(n_windows=2, h=horizon),
+    )
+    with pytest.warns(UserWarning, match="pooled conformity scores"):
+        preds = fcst.predict(h=horizon, new_df=transfer_train, level=[80])
+
+    lo_col = "LinearRegression-lo-80"
+    hi_col = "LinearRegression-hi-80"
+    assert lo_col in preds.columns
+    assert hi_col in preds.columns
+
+    base_ids = set(base["unique_id"].astype(str))
+    transfer_ids = set(transfer_train["unique_id"].astype(str))
+    new_ids = transfer_ids - base_ids
+    assert new_ids
+
+    preds_new = preds[preds["unique_id"].astype(str).isin(new_ids)]
+    assert not preds_new[[lo_col, hi_col]].isna().any().any()
+
+    merged = preds.merge(
+        transfer_valid[["unique_id", "ds", "y"]], on=["unique_id", "ds"], how="left"
+    )
+    merged_new = merged[merged["unique_id"].astype(str).isin(new_ids)]
+    coverage = (
+        (merged_new["y"] >= merged_new[lo_col]) & (merged_new["y"] <= merged_new[hi_col])
+    ).mean()
+    assert 0.0 <= coverage <= 1.0
+
+
+def test_transfer_learning_intervals_groupby_static_features():
+    horizon = 7
+
+    def add_static_groups(df: pd.DataFrame) -> pd.DataFrame:
+        out = df.copy()
+        idx = out["unique_id"].astype(str).str.extract(r"(\d+)").astype(int)[0]
+        out["cat0"] = np.where(idx % 2 == 0, "A", "B")
+        out["cat1"] = np.where((idx // 2) % 2 == 0, "X", "Y")
+        # make groups have different scales to emphasize interval differences
+        out["y"] = out["y"] * np.where(out["cat0"] == "B", 8.0, 1.0)
+        out["cat0"] = out["cat0"].astype("category")
+        out["cat1"] = out["cat1"].astype("category")
+        return out
+
+    base = add_static_groups(
+        generate_daily_series(
+            n_series=4,
+            min_length=80,
+            max_length=80,
+            equal_ends=True,
+            seed=0,
+        )
+    )
+    transfer = add_static_groups(
+        generate_daily_series(
+            n_series=6,
+            min_length=80,
+            max_length=80,
+            equal_ends=True,
+            seed=1,
+        )
+    )
+    transfer_valid = transfer.groupby("unique_id", observed=True).tail(horizon)
+    transfer_train = transfer.drop(transfer_valid.index)
+
+    fit_kwargs = dict(
+        static_features=["cat0", "cat1"],
+        prediction_intervals=PredictionIntervals(n_windows=2, h=horizon),
+    )
+
+    fcst_global = MLForecast(
+        models=lgb.LGBMRegressor(random_state=0, verbosity=-1),
+        freq="D",
+        lags=[1, 7],
+        num_threads=1,
+    ).fit(base, **fit_kwargs)
+    with pytest.warns(UserWarning, match="pooled conformity scores"):
+        preds_global = fcst_global.predict(h=horizon, new_df=transfer_train, level=[80])
+
+    fcst_grouped = MLForecast(
+        models=lgb.LGBMRegressor(random_state=0, verbosity=-1),
+        freq="D",
+        lags=[1, 7],
+        num_threads=1,
+    ).fit(base, **fit_kwargs)
+    with pytest.warns(UserWarning, match="pooled conformity scores"):
+        preds_grouped = fcst_grouped.predict(
+            h=horizon,
+            new_df=transfer_train,
+            level=[80],
+            interval_groupby=["cat0", "cat1"],
+        )
+
+    lo_col = "LGBMRegressor-lo-80"
+    hi_col = "LGBMRegressor-hi-80"
+    width_global = preds_global[hi_col] - preds_global[lo_col]
+    width_grouped = preds_grouped[hi_col] - preds_grouped[lo_col]
+    assert not np.allclose(width_global.values, width_grouped.values)
+
+    base_ids = set(base["unique_id"].astype(str))
+    new_ids = set(transfer_train["unique_id"].astype(str)) - base_ids
+    merged_grouped = preds_grouped.merge(
+        transfer_valid[["unique_id", "ds", "y"]], on=["unique_id", "ds"], how="left"
+    )
+    merged_new = merged_grouped[merged_grouped["unique_id"].astype(str).isin(new_ids)]
+    coverage_grouped = (
+        (merged_new["y"] >= merged_new[lo_col]) & (merged_new["y"] <= merged_new[hi_col])
+    ).mean()
+    assert 0.0 <= coverage_grouped <= 1.0
+
+
+def test_transfer_learning_intervals_groupby_error_when_group_missing():
+    horizon = 5
+    base = generate_daily_series(
+        n_series=2,
+        min_length=60,
+        max_length=60,
+        equal_ends=True,
+        seed=0,
+    )
+    transfer = generate_daily_series(
+        n_series=3,
+        min_length=60,
+        max_length=60,
+        equal_ends=True,
+        seed=1,
+    )
+    base["cat0"] = "A"
+    transfer["cat0"] = "B"
+    base["cat0"] = base["cat0"].astype("category")
+    transfer["cat0"] = transfer["cat0"].astype("category")
+    transfer_valid = transfer.groupby("unique_id", observed=True).tail(horizon)
+    transfer_train = transfer.drop(transfer_valid.index)
+
+    fcst = MLForecast(
+        models=lgb.LGBMRegressor(random_state=0, verbosity=-1),
+        freq="D",
+        lags=[1, 7],
+        num_threads=1,
+    )
+    fcst.fit(
+        base,
+        static_features=["cat0"],
+        prediction_intervals=PredictionIntervals(n_windows=2, h=horizon),
+    )
+    with pytest.raises(ValueError, match="No calibrated series found for interval group"):
+        fcst.predict(
+            h=horizon,
+            new_df=transfer_train,
+            level=[80],
+            interval_groupby=["cat0"],
+            interval_groupby_fallback="error",
+        )
+
+
 @pytest.fixture
 def fcst_with_intervals(fcst, setup_forecast_data):
     """Forecast object fitted with prediction intervals."""

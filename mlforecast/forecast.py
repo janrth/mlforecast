@@ -196,6 +196,8 @@ def _get_conformal_method(method: str):
     available_methods = {
         "conformal_distribution": _add_conformal_distribution_intervals,
         "conformal_error": _add_conformal_error_intervals,
+        # Global pooled conformal intervals use distribution method with pooled scores.
+        "global": _add_conformal_distribution_intervals,
     }
     if method not in available_methods.keys():
         raise ValueError(
@@ -945,7 +947,7 @@ class MLForecast:
                     cs_ids = set(self._cs_df[active_ts.id_col].unique().to_list())
                 else:
                     cs_ids = set(self._cs_df[active_ts.id_col].unique().tolist())
-                use_pooled_scores = False
+                use_pooled_scores = self.prediction_intervals.method == "global"
                 if ids is None:
                     active_ids = set(active_ts.uids)
                     if cs_ids != active_ids:

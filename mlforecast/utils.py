@@ -145,7 +145,7 @@ class PredictionIntervals:
             raise ValueError(
                 "You need at least two windows to compute conformal intervals"
             )
-        allowed_methods = ["conformal_error", "conformal_distribution"]
+        allowed_methods = ["conformal_error", "conformal_distribution", "global"]
         if method not in allowed_methods:
             raise ValueError(f"method must be one of {allowed_methods}")
         self.n_windows = n_windows
