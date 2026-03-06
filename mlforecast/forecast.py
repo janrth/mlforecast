@@ -55,6 +55,7 @@ def _add_conformal_distribution_intervals(
     cs_h: int,
     n_series: int,
     horizon: int,
+    use_pooled: bool = False,
 ) -> DFType:
     """
     Adds conformal intervals to a `fcst_df` based on conformal scores `cs_df`.
@@ -66,17 +67,53 @@ def _add_conformal_distribution_intervals(
     cuts = [alpha / 200 for alpha in reversed(alphas)]
     cuts.extend(1 - alpha / 200 for alpha in alphas)
     for model in model_names:
-        scores = cs_df[model].to_numpy().reshape(cs_n_windows, n_series, cs_h)
-        # restrict scores to horizon
-        scores = scores[:, :, :horizon]
-        mean = fcst_df[model].to_numpy().reshape(1, n_series, -1)
-        scores = np.vstack([mean - scores, mean + scores])
-        quantiles = np.quantile(
-            scores,
-            cuts,
-            axis=0,
-        )
-        quantiles = quantiles.reshape(len(cuts), -1).T
+        mean = fcst_df[model].to_numpy().ravel()
+        if mean.size % n_series != 0:
+            raise ValueError(
+                f"Forecasts for model '{model}' have {mean.size} rows, but "
+                f"this isn't divisible by n_series={n_series}."
+            )
+        forecast_steps = mean.size // n_series
+        score_values = cs_df[model].to_numpy()
+        score_size = score_values.size
+        denom = cs_n_windows * cs_h
+        if score_size % denom != 0:
+            raise ValueError(
+                f"Conformity scores for model '{model}' have {score_size} rows, "
+                f"which is incompatible with n_windows={cs_n_windows} and cs_h={cs_h}. "
+                f"Expected a multiple of {denom}."
+            )
+        calibrated_n_series = score_size // denom
+        if not use_pooled and calibrated_n_series != n_series:
+            raise ValueError(
+                "Prediction intervals were calibrated on "
+                f"{calibrated_n_series} series but forecasting {n_series} series. "
+                "Use transfer learning with pooled conformity scores or refit "
+                "prediction intervals on the target series."
+            )
+        scores = score_values.reshape(cs_n_windows, calibrated_n_series, cs_h)
+        effective_horizon = min(horizon, forecast_steps)
+        scores = scores[:, :, :effective_horizon]
+        if use_pooled:
+            pooled_scores = scores.reshape(-1, cs_h)[:, :effective_horizon]
+            signed_quantiles = np.empty((len(cuts), effective_horizon))
+            for i in range(effective_horizon):
+                signed_scores = np.concatenate(
+                    [-pooled_scores[:, i], pooled_scores[:, i]]
+                )
+                signed_quantiles[:, i] = np.quantile(signed_scores, cuts)
+            horizon_idxs = np.tile(np.arange(forecast_steps), n_series)
+            quantiles = (mean + signed_quantiles[:, horizon_idxs]).T
+        else:
+            scores = scores[:, :n_series, :]
+            mean_3d = mean.reshape(1, n_series, forecast_steps)
+            signed_scores = np.vstack([mean_3d - scores, mean_3d + scores])
+            quantiles = np.quantile(
+                signed_scores,
+                cuts,
+                axis=0,
+            )
+            quantiles = quantiles.reshape(len(cuts), -1).T
         lo_cols = [f"{model}-lo-{lv}" for lv in reversed(level)]
         hi_cols = [f"{model}-hi-{lv}" for lv in level]
         out_cols = lo_cols + hi_cols
@@ -93,6 +130,7 @@ def _add_conformal_error_intervals(
     cs_h: int,
     n_series: int,
     horizon: int,
+    use_pooled: bool = False,
 ) -> DFType:
     """
     Adds conformal intervals to a `fcst_df` based on conformal scores `cs_df`.
@@ -103,14 +141,48 @@ def _add_conformal_error_intervals(
     cuts = [lv / 100 for lv in level]
     for model in model_names:
         mean = fcst_df[model].to_numpy().ravel()
-        scores = cs_df[model].to_numpy().reshape(cs_n_windows, n_series, cs_h)
-        # restrict scores to horizon
-        scores = scores[:, :, :horizon]
-        quantiles = np.quantile(
-            scores,
-            cuts,
-            axis=0,
-        )
+        if mean.size % n_series != 0:
+            raise ValueError(
+                f"Forecasts for model '{model}' have {mean.size} rows, but "
+                f"this isn't divisible by n_series={n_series}."
+            )
+        forecast_steps = mean.size // n_series
+        score_values = cs_df[model].to_numpy()
+        score_size = score_values.size
+        denom = cs_n_windows * cs_h
+        if score_size % denom != 0:
+            raise ValueError(
+                f"Conformity scores for model '{model}' have {score_size} rows, "
+                f"which is incompatible with n_windows={cs_n_windows} and cs_h={cs_h}. "
+                f"Expected a multiple of {denom}."
+            )
+        calibrated_n_series = score_size // denom
+        if not use_pooled and calibrated_n_series != n_series:
+            raise ValueError(
+                "Prediction intervals were calibrated on "
+                f"{calibrated_n_series} series but forecasting {n_series} series. "
+                "Use transfer learning with pooled conformity scores or refit "
+                "prediction intervals on the target series."
+            )
+        scores = score_values.reshape(cs_n_windows, calibrated_n_series, cs_h)
+        effective_horizon = min(horizon, forecast_steps)
+        scores = scores[:, :, :effective_horizon]
+        if use_pooled:
+            pooled_scores = scores.reshape(-1, cs_h)[:, :effective_horizon]
+            quantiles = np.quantile(
+                pooled_scores,
+                cuts,
+                axis=0,
+            )
+            horizon_idxs = np.tile(np.arange(forecast_steps), n_series)
+            quantiles = quantiles[:, horizon_idxs]
+        else:
+            scores = scores[:, :n_series, :]
+            quantiles = np.quantile(
+                scores,
+                cuts,
+                axis=0,
+            )
         quantiles = quantiles.reshape(len(cuts), -1)
         lo_cols = [f"{model}-lo-{lv}" for lv in reversed(level)]
         hi_cols = [f"{model}-hi-{lv}" for lv in level]
@@ -783,6 +855,8 @@ class MLForecast:
         level: Optional[List[Union[int, float]]] = None,
         X_df: Optional[DFType] = None,
         ids: Optional[List[str]] = None,
+        interval_groupby: Optional[List[str]] = None,
+        interval_groupby_fallback: str = "global",
     ) -> DFType:
         """Compute the predictions for the next `h` steps.
 
@@ -794,6 +868,8 @@ class MLForecast:
             level (list of ints or floats, optional): Confidence levels between 0 and 100 for prediction intervals. Defaults to None.
             X_df (pandas or polars DataFrame, optional): Dataframe with the future exogenous features. Should have the id column and the time column. Defaults to None.
             ids (list of str, optional): List with subset of ids seen during training for which the forecasts should be computed. Defaults to None.
+            interval_groupby (list of str, optional): Static feature columns used to pool conformity scores within groups when transfer-learning intervals need fallback to pooled scores. Works with one or multiple columns. Defaults to None.
+            interval_groupby_fallback (str): Behavior when a forecast group has no calibrated series. One of `global` or `error`. Defaults to `global`.
 
         Returns:
             pandas or polars DataFrame: Predictions for each serie and timestep, with one column per model.
@@ -821,10 +897,6 @@ class MLForecast:
 
         new_ts: Optional[TimeSeries] = None
         if new_df is not None:
-            if level is not None:
-                raise ValueError(
-                    "Prediction intervals are not supported in transfer learning."
-                )
             new_ts = TimeSeries(
                 freq=self.ts.freq,
                 lags=self.ts.lags,
@@ -850,10 +922,10 @@ class MLForecast:
             new_ts.max_horizon = self.ts.max_horizon
             new_ts._horizons = self.ts._horizons
             new_ts.as_numpy = self.ts.as_numpy
-            ts = new_ts
+            active_ts = new_ts
         else:
-            ts = self.ts
-        forecasts = ts.predict(
+            active_ts = self.ts
+        forecasts = active_ts.predict(
             models=self.models_,
             horizon=h,
             before_predict_callback=before_predict_callback,
@@ -861,9 +933,6 @@ class MLForecast:
             X_df=X_df,
             ids=ids,
         )
-        if new_ts is not None:
-            # Persist transfer-learning state only after a successful prediction.
-            self.ts = new_ts
         if level is not None:
             if self._cs_df is None:
                 warn_msg = (
@@ -873,25 +942,44 @@ class MLForecast:
                 warnings.warn(warn_msg, UserWarning)
             else:
                 if isinstance(self._cs_df, pl_DataFrame):
-                    cs_ids = set(self._cs_df[self.ts.id_col].unique().to_list())
+                    cs_ids = set(self._cs_df[active_ts.id_col].unique().to_list())
                 else:
-                    cs_ids = set(self._cs_df[self.ts.id_col].unique().tolist())
+                    cs_ids = set(self._cs_df[active_ts.id_col].unique().tolist())
+                use_pooled_scores = False
                 if ids is None:
-                    active_ids = set(self.ts.uids)
+                    active_ids = set(active_ts.uids)
                     if cs_ids != active_ids:
-                        raise ValueError(
-                            "Prediction intervals were calibrated on a different set of series "
-                            "than the current forecasting state. Please rerun `fit` before "
-                            "requesting intervals."
-                        )
+                        if new_df is not None:
+                            warnings.warn(
+                                "Prediction intervals were calibrated on a different set "
+                                "of series than the current transfer-learning state. "
+                                "Falling back to pooled conformity scores.",
+                                UserWarning,
+                            )
+                            use_pooled_scores = True
+                        else:
+                            raise ValueError(
+                                "Prediction intervals were calibrated on a different set of series "
+                                "than the current forecasting state. Please rerun `fit` before "
+                                "requesting intervals."
+                            )
                 else:
                     missing_ids = set(ids) - cs_ids
                     if missing_ids:
-                        raise ValueError(
-                            "Prediction intervals are only available for series seen during "
-                            "interval calibration. Missing ids: "
-                            f"{missing_ids}."
-                        )
+                        if new_df is not None:
+                            warnings.warn(
+                                "Prediction intervals requested for transfer-learning ids "
+                                f"not seen during interval calibration ({missing_ids}). "
+                                "Falling back to pooled conformity scores.",
+                                UserWarning,
+                            )
+                            use_pooled_scores = True
+                        else:
+                            raise ValueError(
+                                "Prediction intervals are only available for series seen during "
+                                "interval calibration. Missing ids: "
+                                f"{missing_ids}."
+                            )
                 if (self.prediction_intervals.h != 1) and (
                     self.prediction_intervals.h < h
                 ):
@@ -914,23 +1002,115 @@ class MLForecast:
                 conformal_method = _get_conformal_method(
                     self.prediction_intervals.method
                 )
-                if ids is not None:
-                    ids_mask = ufp.is_in(self._cs_df[self.ts.id_col], ids)
+                if use_pooled_scores and interval_groupby:
+                    if interval_groupby_fallback not in {"global", "error"}:
+                        raise ValueError(
+                            "interval_groupby_fallback must be one of {'global', 'error'}."
+                        )
+                    id_col = active_ts.id_col
+                    time_col = active_ts.time_col
+                    calib_static = self.ts.static_features_
+                    if isinstance(calib_static, pl_DataFrame):
+                        calib_static_pd = calib_static.to_pandas()
+                    else:
+                        calib_static_pd = calib_static.copy()
+                    if isinstance(active_ts.static_features_, pl_DataFrame):
+                        active_static_pd = active_ts.static_features_.to_pandas()
+                    else:
+                        active_static_pd = active_ts.static_features_.copy()
+                    missing_calib = [c for c in interval_groupby if c not in calib_static_pd.columns]
+                    if missing_calib:
+                        raise ValueError(
+                            "The following interval_groupby columns were not found in calibrated static features: "
+                            f"{missing_calib}."
+                        )
+                    missing_active = [c for c in interval_groupby if c not in active_static_pd.columns]
+                    if missing_active:
+                        raise ValueError(
+                            "The following interval_groupby columns were not found in transfer-learning static features: "
+                            f"{missing_active}."
+                        )
+                    pred_ids = forecasts[id_col].to_numpy()
+                    active_groups = active_static_pd[[id_col, *interval_groupby]].copy()
+                    active_groups = active_groups[active_groups[id_col].isin(pred_ids)]
+                    calib_groups = calib_static_pd[[id_col, *interval_groupby]].copy()
+
+                    def _as_group_key(df):
+                        if len(interval_groupby) == 1:
+                            return df[interval_groupby[0]].astype(object)
+                        return df[interval_groupby].astype(object).apply(tuple, axis=1)
+
+                    active_groups["__grp"] = _as_group_key(active_groups)
+                    calib_groups["__grp"] = _as_group_key(calib_groups)
+                    forecast_ids_by_group = (
+                        active_groups.groupby("__grp", observed=True)[id_col].apply(list).to_dict()
+                    )
+                    calib_ids_by_group = (
+                        calib_groups.groupby("__grp", observed=True)[id_col].apply(list).to_dict()
+                    )
+                    grouped_forecasts = []
+                    for group_key, forecast_group_ids in forecast_ids_by_group.items():
+                        fcst_mask = ufp.is_in(forecasts[id_col], forecast_group_ids)
+                        forecasts_group = ufp.filter_with_mask(forecasts, fcst_mask)
+                        calib_group_ids = calib_ids_by_group.get(group_key, [])
+                        if calib_group_ids:
+                            cs_mask = ufp.is_in(self._cs_df[id_col], calib_group_ids)
+                            cs_group = ufp.filter_with_mask(self._cs_df, cs_mask)
+                        else:
+                            if interval_groupby_fallback == "error":
+                                raise ValueError(
+                                    "No calibrated series found for interval group "
+                                    f"{group_key}. Set interval_groupby_fallback='global' "
+                                    "to use global pooled conformity scores."
+                                )
+                            warnings.warn(
+                                "No calibrated series found for one interval group. "
+                                "Falling back to global pooled conformity scores for that group.",
+                                UserWarning,
+                            )
+                            cs_group = self._cs_df
+                        grouped_forecasts.append(
+                            conformal_method(
+                                forecasts_group,
+                                cs_group,
+                                model_names=list(model_names),
+                                level=level_,
+                                cs_h=self.prediction_intervals.h,
+                                cs_n_windows=self.prediction_intervals.n_windows,
+                                n_series=len(forecast_group_ids),
+                                horizon=h,
+                                use_pooled=True,
+                            )
+                        )
+                    forecasts = grouped_forecasts[0]
+                    for group_fcst in grouped_forecasts[1:]:
+                        forecasts = ufp.vertical_concat([forecasts, group_fcst])
+                    forecasts = ufp.sort(forecasts, [id_col, time_col])
+                elif ids is not None and not use_pooled_scores:
+                    ids_mask = ufp.is_in(self._cs_df[active_ts.id_col], ids)
                     cs_df = ufp.filter_with_mask(self._cs_df, ids_mask)
                     n_series = len(ids)
                 else:
                     cs_df = self._cs_df
-                    n_series = self.ts.ga.n_groups
-                forecasts = conformal_method(
-                    forecasts,
-                    cs_df,
-                    model_names=list(model_names),
-                    level=level_,
-                    cs_h=self.prediction_intervals.h,
-                    cs_n_windows=self.prediction_intervals.n_windows,
-                    n_series=n_series,
-                    horizon=h,
-                )
+                    if ids is not None:
+                        n_series = len(ids)
+                    else:
+                        n_series = active_ts.ga.n_groups
+                if not (use_pooled_scores and interval_groupby):
+                    forecasts = conformal_method(
+                        forecasts,
+                        cs_df,
+                        model_names=list(model_names),
+                        level=level_,
+                        cs_h=self.prediction_intervals.h,
+                        cs_n_windows=self.prediction_intervals.n_windows,
+                        n_series=n_series,
+                        horizon=h,
+                        use_pooled=use_pooled_scores,
+                    )
+        if new_ts is not None:
+            # Persist transfer-learning state only after a successful prediction.
+            self.ts = new_ts
         return forecasts
 
     def cross_validation(

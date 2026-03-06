@@ -329,15 +329,19 @@ class _MLForecastModelWrapper:
         level = attrs.get("level")
         new_df = attrs.get("new_df")
         if new_df is not None:
-            if level is not None:
-                raise MlflowException(
-                    "Prediction intervals are not supported in transfer learning. "
-                    "Please provide either `level` or `new_df`, but not both.",
-                    error_code=INVALID_PARAMETER_VALUE,
-                )
             new_df = pd.DataFrame(new_df).astype(col_types)
         X_df = attrs.get("X_df")
         if X_df is not None:
             X_df = pd.DataFrame(X_df).astype(col_types)
         ids = attrs.get("ids")
-        return self.model.predict(h=h, new_df=new_df, level=level, X_df=X_df, ids=ids)
+        interval_groupby = attrs.get("interval_groupby")
+        interval_groupby_fallback = attrs.get("interval_groupby_fallback", "global")
+        return self.model.predict(
+            h=h,
+            new_df=new_df,
+            level=level,
+            X_df=X_df,
+            ids=ids,
+            interval_groupby=interval_groupby,
+            interval_groupby_fallback=interval_groupby_fallback,
+        )
