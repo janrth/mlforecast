@@ -656,18 +656,29 @@ class TimeSeries:
             return None
         return head
 
+    def _series_leading_nulls(self) -> Optional[np.ndarray]:
+        leading_nulls = np.empty(self.ga.n_groups, dtype=np.int32)
+        for i, (start, stop) in enumerate(zip(self.ga.indptr[:-1], self.ga.indptr[1:])):
+            count = self._leading_null_count(self.ga.data[start:stop])
+            if count is None:
+                return None
+            leading_nulls[i] = count
+        return leading_nulls
+
     def _apply_local_transform_keep_rows(
-        self, keep_rows: np.ndarray, tfm: _BaseLagTransform
+        self,
+        keep_rows: np.ndarray,
+        tfm: _BaseLagTransform,
+        leading_nulls_by_series: np.ndarray,
     ) -> bool:
         if getattr(tfm, "global_", False) or getattr(tfm, "groupby", None):
             return False
         head_nulls = tfm.head_nulls
         if head_nulls is None:
             return False
-        for start, stop in zip(self.ga.indptr[:-1], self.ga.indptr[1:]):
-            leading_nulls = self._leading_null_count(self.ga.data[start:stop])
-            if leading_nulls is None:
-                return False
+        for leading_nulls, start, stop in zip(
+            leading_nulls_by_series, self.ga.indptr[:-1], self.ga.indptr[1:]
+        ):
             invalid_stop = min(stop, start + leading_nulls + head_nulls)
             if invalid_stop <= start:
                 continue
@@ -679,8 +690,6 @@ class TimeSeries:
 
     def _cast_numpy_features(self, X: np.ndarray) -> np.ndarray:
         dtype = self.as_numpy_dtype
-        if dtype is None and self.as_numpy:
-            dtype = np.dtype(np.float32)
         if X.dtype == object or dtype is None:
             return X
         return X.astype(dtype, copy=False)
@@ -760,20 +769,26 @@ class TimeSeries:
         x_cols: List[str],
         keep_rows: np.ndarray,
     ) -> np.ndarray:
-        n_rows = int(keep_rows.sum()) if not keep_rows.all() else df.shape[0]
+        kept_idxs: Optional[np.ndarray]
+        if keep_rows.all():
+            n_rows = df.shape[0]
+            kept_idxs = None
+        else:
+            kept_idxs = np.flatnonzero(keep_rows)
+            n_rows = kept_idxs.size
         n_cols = len(x_cols)
         existing_cols = [c for c in x_cols if c in df.columns]
         existing_np: Optional[np.ndarray] = None
         if existing_cols:
             if isinstance(df, pd.DataFrame):
-                if keep_rows.all():
+                if kept_idxs is None:
                     existing_df = df[existing_cols]
                 else:
-                    existing_df = df.loc[keep_rows, existing_cols]
+                    existing_df = df.iloc[kept_idxs][existing_cols]
             else:
                 existing_df = df.select(existing_cols)
-                if not keep_rows.all():
-                    existing_df = ufp.filter_with_mask(existing_df, keep_rows)
+                if kept_idxs is not None:
+                    existing_df = ufp.take_rows(existing_df, kept_idxs)
             existing_np = ufp.to_numpy(existing_df)
             del existing_df
         dtype: np.dtype[Any]
@@ -794,8 +809,8 @@ class TimeSeries:
             if name in df:
                 continue
             values = self._restore_feature_order(values)
-            if not keep_rows.all():
-                values = values[keep_rows]
+            if kept_idxs is not None:
+                values = values[kept_idxs]
             X[:, col_idx[name]] = values
 
         names = [f.__name__ if callable(f) else f for f in self.date_features]
@@ -803,7 +818,9 @@ class TimeSeries:
             f for f, name in zip(self.date_features, names) if name not in df
         ]
         if isinstance(df, pd.DataFrame):
-            kept_times = df[self.time_col] if keep_rows.all() else df.loc[keep_rows, self.time_col]
+            kept_times = (
+                df[self.time_col] if kept_idxs is None else df.iloc[kept_idxs][self.time_col]
+            )
             unique_dates = pd.Index(kept_times.unique())
             date2pos = {date: i for i, date in enumerate(unique_dates)}
             restore_idxs = kept_times.map(date2pos)
@@ -812,8 +829,8 @@ class TimeSeries:
                 X[:, col_idx[feat_name]] = feat_vals[restore_idxs]
         else:
             time_df = df.select(self.time_col)
-            if not keep_rows.all():
-                time_df = ufp.filter_with_mask(time_df, keep_rows)
+            if kept_idxs is not None:
+                time_df = ufp.take_rows(time_df, kept_idxs)
             for feat in date_features:  # type: ignore
                 name, vals = self._compute_date_feature(pl.col(self.time_col), feat)
                 X[:, col_idx[name]] = time_df.select(vals.alias(name))[name].to_numpy()
@@ -836,11 +853,18 @@ class TimeSeries:
             target_nulls = target_nulls.all(axis=1)
         keep_rows = ~target_nulls
         if dropna:
+            leading_nulls_by_series: Optional[np.ndarray] = None
             inferred_transforms = set()
             for name, tfm in self.transforms.items():
                 if name in df or not isinstance(tfm, _BaseLagTransform):
                     continue
-                if self._apply_local_transform_keep_rows(keep_rows, tfm):
+                if leading_nulls_by_series is None:
+                    leading_nulls_by_series = self._series_leading_nulls()
+                if leading_nulls_by_series is None:
+                    continue
+                if self._apply_local_transform_keep_rows(
+                    keep_rows, tfm, leading_nulls_by_series
+                ):
                     inferred_transforms.add(name)
             for name, values in self._iter_feature_arrays(df):
                 if name in df or name in inferred_transforms:
@@ -892,6 +916,7 @@ class TimeSeries:
         return_X_y: bool = False,
         as_numpy: bool = False,
         as_numpy_dtype: Optional[np.dtype] = None,
+        low_memory_return_X_y: bool = False,
     ) -> DFType:
         """Add the features to `df`.
 
@@ -915,12 +940,12 @@ class TimeSeries:
         target = self._extract_target(effective_max_horizon)
         if as_numpy_dtype is not None:
             self.as_numpy_dtype = np.dtype(as_numpy_dtype)
-        elif as_numpy:
+        elif as_numpy and low_memory_return_X_y:
             self.as_numpy_dtype = np.dtype(np.float32)
         else:
             self.as_numpy_dtype = None
 
-        if return_X_y:
+        if return_X_y and low_memory_return_X_y:
             X, target = self._transform_to_X_y(
                 df=df,
                 target=target,
@@ -1071,6 +1096,15 @@ class TimeSeries:
         else:
             df = ufp.copy_if_pandas(df, deep=False)
             df = ufp.assign_columns(df, self.target_col, target)
+        if return_X_y:
+            if self.weight_col is not None:
+                x_cols = [self.weight_col, *self.features_order_]
+            else:
+                x_cols = self.features_order_
+            X = df[x_cols]
+            if as_numpy:
+                X = self._cast_numpy_features(ufp.to_numpy(X))
+            return X, target
         return df
 
     def _transform_per_horizon(
@@ -1193,6 +1227,7 @@ class TimeSeries:
         return_X_y: bool = False,
         as_numpy: bool = False,
         as_numpy_dtype: Optional[np.dtype] = None,
+        low_memory_return_X_y: bool = False,
         weight_col: Optional[str] = None,
     ) -> Union[DFType, Tuple[DFType, np.ndarray]]:
         """Add the features to `data` and save the required information for the predictions step.
@@ -1225,6 +1260,7 @@ class TimeSeries:
             return_X_y=return_X_y,
             as_numpy=as_numpy,
             as_numpy_dtype=as_numpy_dtype,
+            low_memory_return_X_y=low_memory_return_X_y,
         )
 
     def _update_y(self, new: np.ndarray) -> None:

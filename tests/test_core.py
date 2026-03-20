@@ -9,7 +9,6 @@ import pandas as pd
 import polars as pl
 import pytest
 import utilsforecast.processing as ufp
-
 from mlforecast.callbacks import SaveFeatures
 from mlforecast.core import (
     TimeSeries,
@@ -815,7 +814,7 @@ def test_return_xy_matches_preprocess_for_global_and_group_features(engine, as_n
         )
 
 
-def test_return_xy_numeric_numpy_is_float32(series):
+def test_return_xy_numeric_numpy_preprocess_path_preserves_default_dtype(series):
     df = series.copy()
     df["weight"] = np.random.default_rng(0).random(len(df)).astype(np.float32)
     ts = TimeSeries(
@@ -832,6 +831,29 @@ def test_return_xy_numeric_numpy_is_float32(series):
         static_features=["static_0", "static_1"],
         return_X_y=True,
         as_numpy=True,
+        weight_col="weight",
+    )
+    assert X.dtype == np.float64
+
+
+def test_return_xy_numeric_numpy_fit_path_defaults_to_float32(series):
+    df = series.copy()
+    df["weight"] = np.random.default_rng(0).random(len(df)).astype(np.float32)
+    ts = TimeSeries(
+        freq="D",
+        lags=[1, 7],
+        lag_transforms={1: [RollingMean(3), RollingStd(3)]},
+        date_features=["weekday", "month"],
+    )
+    X, _ = ts.fit_transform(
+        df,
+        id_col="unique_id",
+        time_col="ds",
+        target_col="y",
+        static_features=["static_0", "static_1"],
+        return_X_y=True,
+        as_numpy=True,
+        low_memory_return_X_y=True,
         weight_col="weight",
     )
     assert X.dtype == np.float32

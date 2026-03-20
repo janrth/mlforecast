@@ -693,30 +693,51 @@ class MLForecast:
                 fitted_values = ufp.drop_index_if_pandas(fitted_values)
                 self.fcst_fitted_values_ = fitted_values
         else:
-            # Standard recursive path (unchanged)
-            prep = self.preprocess(
-                df=df,
-                id_col=id_col,
-                time_col=time_col,
-                target_col=target_col,
-                static_features=static_features,
-                dropna=dropna,
-                keep_last_n=keep_last_n,
-                max_horizon=max_horizon,
-                return_X_y=not fitted,
-                as_numpy=as_numpy,
-                as_numpy_dtype=as_numpy_dtype,
-                weight_col=weight_col,
-                validate_data=validate_data,
-            )
-            if isinstance(prep, tuple):
-                X, y = prep
-            else:
+            # Standard recursive path: keep the lower-memory direct X/y build for fit,
+            # but leave public preprocess on the faster dataframe assembly path.
+            if fitted:
+                prep = self.preprocess(
+                    df=df,
+                    id_col=id_col,
+                    time_col=time_col,
+                    target_col=target_col,
+                    static_features=static_features,
+                    dropna=dropna,
+                    keep_last_n=keep_last_n,
+                    max_horizon=max_horizon,
+                    return_X_y=False,
+                    as_numpy=as_numpy,
+                    as_numpy_dtype=as_numpy_dtype,
+                    weight_col=weight_col,
+                    validate_data=validate_data,
+                )
                 base = prep[[id_col, time_col]]
                 X, y = self._extract_X_y(prep, target_col, weight_col)
                 if as_numpy:
+                    if as_numpy_dtype is not None:
+                        self.ts.as_numpy_dtype = np.dtype(as_numpy_dtype)
+                    else:
+                        self.ts.as_numpy_dtype = np.dtype(np.float32)
                     X = self.ts._cast_numpy_features(ufp.to_numpy(X))
                 del prep
+            else:
+                if validate_data:
+                    self._validate_data(df, id_col, time_col)
+                X, y = self.ts.fit_transform(
+                    df,
+                    id_col=id_col,
+                    time_col=time_col,
+                    target_col=target_col,
+                    static_features=static_features,
+                    dropna=dropna,
+                    keep_last_n=keep_last_n,
+                    max_horizon=max_horizon,
+                    return_X_y=True,
+                    as_numpy=as_numpy,
+                    as_numpy_dtype=as_numpy_dtype,
+                    low_memory_return_X_y=True,
+                    weight_col=weight_col,
+                )
             self.fit_models(X, y, models_fit_kwargs)
             if fitted:
                 fitted_values = self._compute_fitted_values(
