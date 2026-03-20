@@ -111,6 +111,14 @@ class _BaseLagTransform(BaseEstimator):
     def update_samples(self) -> int:
         return -1
 
+    @property
+    def head_nulls(self) -> Optional[int]:
+        return None
+
+    @property
+    def _actual_lag(self) -> int:
+        return self._core_tfm.lag
+
 
 class Lag(_BaseLagTransform):
     def __init__(self, lag: int):
@@ -128,6 +136,10 @@ class Lag(_BaseLagTransform):
 
     @property
     def update_samples(self) -> int:
+        return self.lag
+
+    @property
+    def head_nulls(self) -> int:
         return self.lag
 
 
@@ -169,11 +181,24 @@ class _RollingBase(_BaseLagTransform):
     def update_samples(self) -> int:
         return self._lag + self.window_size
 
+    @property
+    def _effective_min_samples(self) -> int:
+        min_samples = self.window_size if self.min_samples is None else self.min_samples
+        return max(min_samples, 1)
+
+    @property
+    def head_nulls(self) -> int:
+        return self._actual_lag + self._effective_min_samples - 1
+
 
 class RollingMean(_RollingBase): ...
 
 
-class RollingStd(_RollingBase): ...
+class RollingStd(_RollingBase):
+    @property
+    def _effective_min_samples(self) -> int:
+        min_samples = self.window_size if self.min_samples is None else self.min_samples
+        return max(min_samples, 2)
 
 
 class RollingMin(_RollingBase): ...
@@ -252,11 +277,24 @@ class _Seasonal_RollingBase(_BaseLagTransform):
     def update_samples(self) -> int:
         return self._lag + self.season_length * self.window_size
 
+    @property
+    def _effective_min_samples(self) -> int:
+        min_samples = self.window_size if self.min_samples is None else self.min_samples
+        return max(min_samples, 1)
+
+    @property
+    def head_nulls(self) -> int:
+        return self._actual_lag + self.season_length * (self._effective_min_samples - 1)
+
 
 class SeasonalRollingMean(_Seasonal_RollingBase): ...
 
 
-class SeasonalRollingStd(_Seasonal_RollingBase): ...
+class SeasonalRollingStd(_Seasonal_RollingBase):
+    @property
+    def _effective_min_samples(self) -> int:
+        min_samples = self.window_size if self.min_samples is None else self.min_samples
+        return max(min_samples, 2)
 
 
 class SeasonalRollingMin(_Seasonal_RollingBase): ...
@@ -318,11 +356,18 @@ class _ExpandingBase(_BaseLagTransform):
     def update_samples(self) -> int:
         return 1
 
+    @property
+    def head_nulls(self) -> int:
+        return self._actual_lag
+
 
 class ExpandingMean(_ExpandingBase): ...
 
 
-class ExpandingStd(_ExpandingBase): ...
+class ExpandingStd(_ExpandingBase):
+    @property
+    def head_nulls(self) -> int:
+        return self._actual_lag + 1
 
 
 class ExpandingMin(_ExpandingBase): ...
@@ -381,6 +426,10 @@ class ExponentiallyWeightedMean(_BaseLagTransform):
     def update_samples(self) -> int:
         return 1
 
+    @property
+    def head_nulls(self) -> int:
+        return self._actual_lag
+
 
 class Offset(_BaseLagTransform):
     """Shift series before computing transformation
@@ -407,6 +456,10 @@ class Offset(_BaseLagTransform):
     @property
     def update_samples(self) -> int:
         return self.tfm.update_samples + self.n
+
+    @property
+    def head_nulls(self) -> Optional[int]:
+        return self.tfm.head_nulls
 
 
 class Combine(_BaseLagTransform):
@@ -454,3 +507,11 @@ class Combine(_BaseLagTransform):
     @property
     def update_samples(self):
         return max(self.tfm1.update_samples, self.tfm2.update_samples)
+
+    @property
+    def head_nulls(self) -> Optional[int]:
+        head_nulls_1 = self.tfm1.head_nulls
+        head_nulls_2 = self.tfm2.head_nulls
+        if head_nulls_1 is None or head_nulls_2 is None:
+            return None
+        return max(head_nulls_1, head_nulls_2)

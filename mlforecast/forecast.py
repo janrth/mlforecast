@@ -225,6 +225,7 @@ class MLForecast:
         horizons: Optional[List[int]] = None,
         return_X_y: bool = False,
         as_numpy: bool = False,
+        as_numpy_dtype: Optional[np.dtype] = None,
         weight_col: Optional[str] = None,
         validate_data: bool = True,
     ) -> Union[DFType, Tuple[DFType, np.ndarray]]:
@@ -264,6 +265,7 @@ class MLForecast:
             horizons=horizons,
             return_X_y=return_X_y,
             as_numpy=as_numpy,
+            as_numpy_dtype=as_numpy_dtype,
             weight_col=weight_col,
         )
 
@@ -344,6 +346,7 @@ class MLForecast:
         n_windows: int = 2,
         h: int = 1,
         as_numpy: bool = False,
+        as_numpy_dtype: Optional[np.dtype] = None,
     ) -> DFType:
         """Compute conformity scores.
 
@@ -378,6 +381,7 @@ class MLForecast:
             horizons=horizons,
             prediction_intervals=None,
             as_numpy=as_numpy,
+            as_numpy_dtype=as_numpy_dtype,
         )
         # conformity score for each model
         for model in self.models.keys():
@@ -533,7 +537,10 @@ class MLForecast:
                 for h, model in horizon_models.items():
                     X_h, valid = horizon_cache[h]
                     X_valid = ufp.filter_with_mask(X_h, valid)
-                    X_pred = ufp.to_numpy(X_valid) if models_trained_with_numpy else X_valid
+                    if models_trained_with_numpy:
+                        X_pred = self.ts._cast_numpy_features(ufp.to_numpy(X_valid))
+                    else:
+                        X_pred = X_valid
                     preds_valid = model.predict(X_pred)
                     preds = np.full(len(X_h), np.nan)
                     preds[valid] = preds_valid
@@ -573,6 +580,7 @@ class MLForecast:
         prediction_intervals: Optional[PredictionIntervals] = None,
         fitted: bool = False,
         as_numpy: bool = False,
+        as_numpy_dtype: Optional[np.dtype] = None,
         weight_col: Optional[str] = None,
         models_fit_kwargs: Optional[dict[str, dict[str, Any]]] = None,
         validate_data: bool = True,
@@ -619,6 +627,7 @@ class MLForecast:
                 n_windows=prediction_intervals.n_windows,
                 h=prediction_intervals.h,
                 as_numpy=as_numpy,
+                as_numpy_dtype=as_numpy_dtype,
             )
         # When max_horizon or horizons is set, use generator factory approach
         if max_horizon is not None or horizons is not None:
@@ -635,11 +644,18 @@ class MLForecast:
                 horizons=horizons,
                 return_X_y=False,
                 as_numpy=False,
+                as_numpy_dtype=as_numpy_dtype,
                 weight_col=weight_col,
                 validate_data=validate_data,
             )
             # Restore the as_numpy setting for prediction
             self.ts.as_numpy = as_numpy
+            if as_numpy_dtype is not None:
+                self.ts.as_numpy_dtype = np.dtype(as_numpy_dtype)
+            elif as_numpy:
+                self.ts.as_numpy_dtype = np.dtype(np.float32)
+            else:
+                self.ts.as_numpy_dtype = None
 
             # Get the effective max horizon and internal horizons from preprocessing
             effective_max_horizon = self.ts.max_horizon
@@ -689,6 +705,7 @@ class MLForecast:
                 max_horizon=max_horizon,
                 return_X_y=not fitted,
                 as_numpy=as_numpy,
+                as_numpy_dtype=as_numpy_dtype,
                 weight_col=weight_col,
                 validate_data=validate_data,
             )
@@ -698,7 +715,7 @@ class MLForecast:
                 base = prep[[id_col, time_col]]
                 X, y = self._extract_X_y(prep, target_col, weight_col)
                 if as_numpy:
-                    X = ufp.to_numpy(X)
+                    X = self.ts._cast_numpy_features(ufp.to_numpy(X))
                 del prep
             self.fit_models(X, y, models_fit_kwargs)
             if fitted:
@@ -850,6 +867,7 @@ class MLForecast:
             new_ts.max_horizon = self.ts.max_horizon
             new_ts._horizons = self.ts._horizons
             new_ts.as_numpy = self.ts.as_numpy
+            new_ts.as_numpy_dtype = self.ts.as_numpy_dtype
             ts = new_ts
         else:
             ts = self.ts
@@ -955,6 +973,7 @@ class MLForecast:
         input_size: Optional[int] = None,
         fitted: bool = False,
         as_numpy: bool = False,
+        as_numpy_dtype: Optional[np.dtype] = None,
         weight_col: Optional[str] = None,
         validate_data: bool = True,
     ) -> DFType:
@@ -1022,6 +1041,7 @@ class MLForecast:
                     prediction_intervals=prediction_intervals,
                     fitted=fitted,
                     as_numpy=as_numpy,
+                    as_numpy_dtype=as_numpy_dtype,
                     weight_col=weight_col,
                     validate_data=False,
                 )
@@ -1046,6 +1066,7 @@ class MLForecast:
                     max_horizon=max_horizon,
                     horizons=horizons,
                     return_X_y=False,
+                    as_numpy_dtype=as_numpy_dtype,
                     weight_col=weight_col,
                     validate_data=False,
                 )
@@ -1054,7 +1075,7 @@ class MLForecast:
                 base = prep[[id_col, time_col]]
                 train_X, train_y = self._extract_X_y(prep, target_col, weight_col)
                 if as_numpy:
-                    train_X = ufp.to_numpy(train_X)
+                    train_X = self.ts._cast_numpy_features(ufp.to_numpy(train_X))
                 del prep
                 fitted_values = self._compute_fitted_values(
                     base=base,

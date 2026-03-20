@@ -240,6 +240,7 @@ class TimeSeries:
             lag_transforms=self.lag_transforms,
             namer=lag_transforms_namer,
         )
+        self.as_numpy_dtype: Optional[np.dtype] = None
         self.ga: GroupedArray
 
     def _get_core_lag_tfms(self) -> Dict[str, _BaseLagTransform]:
@@ -556,6 +557,332 @@ class TimeSeries:
                 feat_vals = feat_vals.astype(feat_dtype)
         return feat_name, feat_vals
 
+    def _iter_ga_transform_values(
+        self,
+        ga: GroupedArray,
+        transforms: Mapping[str, Union[Tuple[Any, ...], _BaseLagTransform]],
+        updates_only: bool = False,
+    ) -> Iterator[Tuple[str, np.ndarray]]:
+        if not transforms:
+            return
+        if self.num_threads == 1 or len(transforms) == 1:
+            yield from ga.iter_transforms(transforms=transforms, updates_only=updates_only)
+        else:
+            yield from ga.iter_multithreaded_transforms(
+                transforms=transforms,
+                num_threads=self.num_threads,
+                updates_only=updates_only,
+            )
+
+    def _iter_feature_arrays(self, df: DFType) -> Iterator[Tuple[str, np.ndarray]]:
+        """Yield computed non-date features one at a time."""
+        local_tfms = self._get_local_tfms(self.transforms)
+        yield from self._iter_ga_transform_values(
+            self.ga,
+            transforms=local_tfms,
+            updates_only=False,
+        )
+
+        global_tfms = self._get_global_tfms()
+        if global_tfms:
+            assert self._global_ga is not None
+            assert self._global_times is not None
+            if isinstance(df, pd.DataFrame):
+                for name, vals in self._iter_ga_transform_values(
+                    self._global_ga, transforms=global_tfms, updates_only=False
+                ):
+                    mapped = pd.Series(vals, index=self._global_times)
+                    yield name, df[self.time_col].map(mapped).to_numpy()
+            else:
+                global_time_df = pl_DataFrame({self.time_col: self._global_times})
+                for name, vals in self._iter_ga_transform_values(
+                    self._global_ga, transforms=global_tfms, updates_only=False
+                ):
+                    joined = df.select(self.time_col).join(
+                        global_time_df.with_columns(pl.Series(name=name, values=vals)),
+                        on=self.time_col,
+                        how="left",
+                    )
+                    yield name, joined[name].to_numpy()
+
+        group_tfms = self._get_group_tfms()
+        if group_tfms:
+            for group_cols, tfms in group_tfms.items():
+                state = self._group_states[group_cols]
+                group_df = state["df"]
+                group_cols_list = state["group_cols"]
+                if isinstance(df, pd.DataFrame):
+                    left = df[group_cols_list + [self.time_col]]
+                    join_base = group_df[group_cols_list + [self.time_col]]
+                    for name, vals in self._iter_ga_transform_values(
+                        state["ga"], transforms=tfms, updates_only=False
+                    ):
+                        join_df = join_base.copy()
+                        join_df[name] = vals
+                        joined = left.merge(
+                            join_df,
+                            on=group_cols_list + [self.time_col],
+                            how="left",
+                        )
+                        yield name, joined[name].to_numpy()
+                else:
+                    left = df.select(group_cols_list + [self.time_col])
+                    join_base = group_df.select(group_cols_list + [self.time_col])
+                    for name, vals in self._iter_ga_transform_values(
+                        state["ga"], transforms=tfms, updates_only=False
+                    ):
+                        joined = left.join(
+                            join_base.with_columns(pl.Series(name=name, values=vals)),
+                            on=group_cols_list + [self.time_col],
+                            how="left",
+                        )
+                        yield name, joined[name].to_numpy()
+
+    def _restore_feature_order(self, values: np.ndarray) -> np.ndarray:
+        if self._restore_idxs is not None:
+            values = values[self._restore_idxs]
+        return values
+
+    @staticmethod
+    def _leading_null_count(values: np.ndarray) -> Optional[int]:
+        null_mask = np.isnan(values)
+        if not null_mask.any():
+            return 0
+        valid_idxs = np.flatnonzero(~null_mask)
+        if valid_idxs.size == 0:
+            return values.size
+        head = int(valid_idxs[0])
+        if null_mask[head:].any():
+            return None
+        return head
+
+    def _apply_local_transform_keep_rows(
+        self, keep_rows: np.ndarray, tfm: _BaseLagTransform
+    ) -> bool:
+        if getattr(tfm, "global_", False) or getattr(tfm, "groupby", None):
+            return False
+        head_nulls = tfm.head_nulls
+        if head_nulls is None:
+            return False
+        for start, stop in zip(self.ga.indptr[:-1], self.ga.indptr[1:]):
+            leading_nulls = self._leading_null_count(self.ga.data[start:stop])
+            if leading_nulls is None:
+                return False
+            invalid_stop = min(stop, start + leading_nulls + head_nulls)
+            if invalid_stop <= start:
+                continue
+            if self._sort_idxs is None:
+                keep_rows[start:invalid_stop] = False
+            else:
+                keep_rows[self._sort_idxs[start:invalid_stop]] = False
+        return True
+
+    def _cast_numpy_features(self, X: np.ndarray) -> np.ndarray:
+        dtype = self.as_numpy_dtype
+        if dtype is None and self.as_numpy:
+            dtype = np.dtype(np.float32)
+        if X.dtype == object or dtype is None:
+            return X
+        return X.astype(dtype, copy=False)
+
+    def _finalize_fit_transform_state(self) -> None:
+        update_samples = [
+            getattr(tfm, "update_samples", -1) for tfm in self.transforms.values()
+        ]
+        if (
+            self.keep_last_n is None
+            and update_samples
+            and all(samples > 0 for samples in update_samples)
+        ):
+            self.keep_last_n = max(update_samples)
+        if self.keep_last_n is not None:
+            self.ga = self.ga.take_from_groups(slice(-self.keep_last_n, None))
+        del self._restore_idxs, self._sort_idxs
+
+    def _extract_target(self, effective_max_horizon: Optional[int]) -> np.ndarray:
+        if effective_max_horizon is None:
+            target = self.ga.data
+        else:
+            target = self.ga.expand_target(effective_max_horizon)
+        if self._restore_idxs is not None:
+            target = target[self._restore_idxs]
+        return target
+
+    def _build_x_from_filtered_df(
+        self,
+        original_df: DFType,
+        filtered_df: DFType,
+        x_cols: List[str],
+        keep_rows: np.ndarray,
+    ) -> DFType:
+        existing_cols = [c for c in x_cols if c in filtered_df.columns]
+        if isinstance(filtered_df, pd.DataFrame):
+            X = ufp.copy_if_pandas(filtered_df[existing_cols], deep=False)
+        else:
+            X = filtered_df.select(existing_cols)
+
+        for name, values in self._iter_feature_arrays(original_df):
+            if name in original_df:
+                continue
+            values = self._restore_feature_order(values)
+            if not keep_rows.all():
+                values = values[keep_rows]
+            X = ufp.assign_columns(X, name, values)
+
+        names = [f.__name__ if callable(f) else f for f in self.date_features]
+        date_features = [
+            f for f, name in zip(self.date_features, names) if name not in filtered_df
+        ]
+        if date_features:
+            unique_dates = filtered_df[self.time_col].unique()
+            if isinstance(filtered_df, pd.DataFrame):
+                unique_dates = pd.Index(unique_dates)
+                date2pos = {date: i for i, date in enumerate(unique_dates)}
+                restore_idxs = filtered_df[self.time_col].map(date2pos)
+                for feature in date_features:
+                    feat_name, feat_vals = self._compute_date_feature(
+                        unique_dates, feature
+                    )
+                    X = ufp.assign_columns(X, feat_name, feat_vals[restore_idxs])
+            else:
+                for feat in date_features:  # type: ignore
+                    name, vals = self._compute_date_feature(pl.col(self.time_col), feat)
+                    feat_vals = filtered_df.select(vals.alias(name))[name]
+                    X = ufp.assign_columns(X, name, feat_vals)
+
+        if isinstance(X, pd.DataFrame):
+            return X[x_cols]
+        return X.select(x_cols)
+
+    def _build_x_numpy(
+        self,
+        df: DFType,
+        x_cols: List[str],
+        keep_rows: np.ndarray,
+    ) -> np.ndarray:
+        n_rows = int(keep_rows.sum()) if not keep_rows.all() else df.shape[0]
+        n_cols = len(x_cols)
+        existing_cols = [c for c in x_cols if c in df.columns]
+        existing_np: Optional[np.ndarray] = None
+        if existing_cols:
+            if isinstance(df, pd.DataFrame):
+                if keep_rows.all():
+                    existing_df = df[existing_cols]
+                else:
+                    existing_df = df.loc[keep_rows, existing_cols]
+            else:
+                existing_df = df.select(existing_cols)
+                if not keep_rows.all():
+                    existing_df = ufp.filter_with_mask(existing_df, keep_rows)
+            existing_np = ufp.to_numpy(existing_df)
+            del existing_df
+        dtype: np.dtype[Any]
+        if existing_np is not None and existing_np.dtype == object:
+            dtype = np.dtype(object)
+        else:
+            dtype = self.as_numpy_dtype or np.dtype(np.float32)
+        X = np.empty((n_rows, n_cols), dtype=dtype)
+        col_idx = {col: idx for idx, col in enumerate(x_cols)}
+        if existing_np is not None and existing_cols:
+            if existing_np.ndim == 1:
+                X[:, col_idx[existing_cols[0]]] = existing_np.astype(dtype, copy=False)
+            else:
+                col_positions = [col_idx[col] for col in existing_cols]
+                X[:, col_positions] = existing_np.astype(dtype, copy=False)
+
+        for name, values in self._iter_feature_arrays(df):
+            if name in df:
+                continue
+            values = self._restore_feature_order(values)
+            if not keep_rows.all():
+                values = values[keep_rows]
+            X[:, col_idx[name]] = values
+
+        names = [f.__name__ if callable(f) else f for f in self.date_features]
+        date_features = [
+            f for f, name in zip(self.date_features, names) if name not in df
+        ]
+        if isinstance(df, pd.DataFrame):
+            kept_times = df[self.time_col] if keep_rows.all() else df.loc[keep_rows, self.time_col]
+            unique_dates = pd.Index(kept_times.unique())
+            date2pos = {date: i for i, date in enumerate(unique_dates)}
+            restore_idxs = kept_times.map(date2pos)
+            for feature in date_features:
+                feat_name, feat_vals = self._compute_date_feature(unique_dates, feature)
+                X[:, col_idx[feat_name]] = feat_vals[restore_idxs]
+        else:
+            time_df = df.select(self.time_col)
+            if not keep_rows.all():
+                time_df = ufp.filter_with_mask(time_df, keep_rows)
+            for feat in date_features:  # type: ignore
+                name, vals = self._compute_date_feature(pl.col(self.time_col), feat)
+                X[:, col_idx[name]] = time_df.select(vals.alias(name))[name].to_numpy()
+        return X
+
+    def _transform_to_X_y(
+        self,
+        df: DFType,
+        target: np.ndarray,
+        dropna: bool,
+        as_numpy: bool,
+    ) -> Tuple[Union[DFType, np.ndarray], np.ndarray]:
+        if self.weight_col is not None:
+            x_cols = [self.weight_col, *self.features_order_]
+        else:
+            x_cols = self.features_order_
+
+        target_nulls = np.isnan(target)
+        if target_nulls.ndim == 2:
+            target_nulls = target_nulls.all(axis=1)
+        keep_rows = ~target_nulls
+        if dropna:
+            inferred_transforms = set()
+            for name, tfm in self.transforms.items():
+                if name in df or not isinstance(tfm, _BaseLagTransform):
+                    continue
+                if self._apply_local_transform_keep_rows(keep_rows, tfm):
+                    inferred_transforms.add(name)
+            for name, values in self._iter_feature_arrays(df):
+                if name in df or name in inferred_transforms:
+                    continue
+                values = self._restore_feature_order(values)
+                keep_rows &= ~np.isnan(values)
+
+        filtered_target = target if keep_rows.all() else target[keep_rows]
+        if not keep_rows.all():
+            last_idxs = self.ga.indptr[1:] - 1
+            if self._sort_idxs is not None:
+                last_idxs = self._sort_idxs[last_idxs]
+            last_vals_nan = ~keep_rows[last_idxs]
+            self._dropped_series = None
+            if last_vals_nan.any():
+                self._dropped_series = np.where(last_vals_nan)[0]
+                dropped_ids = reprlib.repr(list(self.uids[self._dropped_series]))
+                warnings.warn(
+                    "The following series were dropped completely "
+                    f"due to the transformations and features: {dropped_ids}.\n"
+                    "These series won't show up if you use `MLForecast.forecast_fitted_values()`.\n"
+                    "You can set `dropna=False` or use transformations that require less samples to mitigate this"
+                )
+        if keep_rows.all():
+            self._dropped_series = None
+
+        if as_numpy:
+            X = self._build_x_numpy(df=df, x_cols=x_cols, keep_rows=keep_rows)
+        else:
+            if keep_rows.all():
+                filtered_df = ufp.copy_if_pandas(df, deep=False)
+            else:
+                filtered_df = ufp.filter_with_mask(df, keep_rows)
+                filtered_df = ufp.copy_if_pandas(filtered_df, deep=False)
+            X = self._build_x_from_filtered_df(
+                original_df=df,
+                filtered_df=filtered_df,
+                x_cols=x_cols,
+                keep_rows=keep_rows,
+            )
+        return X, filtered_target
+
     def _transform(
         self,
         df: DFType,
@@ -564,6 +891,7 @@ class TimeSeries:
         horizons: Optional[List[int]] = None,
         return_X_y: bool = False,
         as_numpy: bool = False,
+        as_numpy_dtype: Optional[np.dtype] = None,
     ) -> DFType:
         """Add the features to `df`.
 
@@ -581,6 +909,26 @@ class TimeSeries:
         self._horizons, effective_max_horizon = _validate_horizon_params(
             max_horizon, horizons
         )
+
+        # target
+        self.max_horizon = effective_max_horizon
+        target = self._extract_target(effective_max_horizon)
+        if as_numpy_dtype is not None:
+            self.as_numpy_dtype = np.dtype(as_numpy_dtype)
+        elif as_numpy:
+            self.as_numpy_dtype = np.dtype(np.float32)
+        else:
+            self.as_numpy_dtype = None
+
+        if return_X_y:
+            X, target = self._transform_to_X_y(
+                df=df,
+                target=target,
+                dropna=dropna,
+                as_numpy=as_numpy,
+            )
+            self._finalize_fit_transform_state()
+            return X, target
 
         # we need to compute all transformations in case they save state
         features = self._compute_transforms(
@@ -641,15 +989,6 @@ class TimeSeries:
             for k, v in features.items():
                 features[k] = v[self._restore_idxs]
 
-        # target
-        self.max_horizon = effective_max_horizon
-        if effective_max_horizon is None:
-            target = self.ga.data
-        else:
-            target = self.ga.expand_target(effective_max_horizon)
-        if self._restore_idxs is not None:
-            target = target[self._restore_idxs]
-
         # determine rows to keep
         target_nulls = np.isnan(target)
         if target_nulls.ndim == 2:
@@ -665,7 +1004,7 @@ class TimeSeries:
             # we always want to drop rows with nulls in the target
             keep_rows = ~target_nulls
 
-        self._dropped_series: Optional[np.ndarray] = None
+        self._dropped_series = None
         if not keep_rows.all():
             # remove rows with nulls
             for k, v in features.items():
@@ -691,19 +1030,7 @@ class TimeSeries:
             df = df.copy(deep=False)
 
         # once we've computed the features and target we can slice the series
-        update_samples = [
-            getattr(tfm, "update_samples", -1) for tfm in self.transforms.values()
-        ]
-        if (
-            self.keep_last_n is None
-            and update_samples
-            and all(samples > 0 for samples in update_samples)
-        ):
-            # user didn't set keep_last_n and we can infer it from the transforms
-            self.keep_last_n = max(update_samples)
-        if self.keep_last_n is not None:
-            self.ga = self.ga.take_from_groups(slice(-self.keep_last_n, None))
-        del self._restore_idxs, self._sort_idxs
+        self._finalize_fit_transform_state()
 
         # lag transforms
         for feat in self.transforms.keys():
@@ -735,16 +1062,6 @@ class TimeSeries:
                 feats = unique_dates.to_frame().with_columns(*exprs)
                 df = df.join(feats, on=self.time_col, how="left")
 
-        # assemble return
-        if return_X_y:
-            if self.weight_col is not None:
-                x_cols = [self.weight_col, *self.features_order_]
-            else:
-                x_cols = self.features_order_
-            X = df[x_cols]
-            if as_numpy:
-                X = ufp.to_numpy(X)
-            return X, target
         if effective_max_horizon is not None:
             # remove original target
             out_cols = [c for c in df.columns if c != self.target_col]
@@ -858,6 +1175,7 @@ class TimeSeries:
 
             if as_numpy:
                 X_h = ufp.to_numpy(X_h)
+                X_h = self._cast_numpy_features(X_h)
 
             yield h, X_h, y_h
 
@@ -874,6 +1192,7 @@ class TimeSeries:
         horizons: Optional[List[int]] = None,
         return_X_y: bool = False,
         as_numpy: bool = False,
+        as_numpy_dtype: Optional[np.dtype] = None,
         weight_col: Optional[str] = None,
     ) -> Union[DFType, Tuple[DFType, np.ndarray]]:
         """Add the features to `data` and save the required information for the predictions step.
@@ -905,6 +1224,7 @@ class TimeSeries:
             horizons=horizons,
             return_X_y=return_X_y,
             as_numpy=as_numpy,
+            as_numpy_dtype=as_numpy_dtype,
         )
 
     def _update_y(self, new: np.ndarray) -> None:
@@ -1031,7 +1351,7 @@ class TimeSeries:
         self._h += 1
         new_x = new_x[self.features_order_]
         if self.as_numpy:
-            new_x = ufp.to_numpy(new_x)
+            new_x = self._cast_numpy_features(ufp.to_numpy(new_x))
         return new_x
 
     @contextmanager

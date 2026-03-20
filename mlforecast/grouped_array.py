@@ -2,7 +2,7 @@ __all__ = ['GroupedArray']
 
 
 import concurrent.futures
-from typing import Any, Dict, Mapping, Tuple, Union
+from typing import Any, Dict, Iterator, Mapping, Tuple, Union
 
 import numpy as np
 from coreforecast.grouped_array import GroupedArray as CoreGroupedArray
@@ -66,6 +66,27 @@ class GroupedArray:
         indptr = np.append(0, sizes.cumsum())
         return GroupedArray(data, indptr)
 
+    def iter_transforms(
+        self,
+        transforms: Mapping[str, Union[Tuple[Any, ...], _BaseLagTransform]],
+        updates_only: bool = False,
+    ) -> Iterator[Tuple[str, np.ndarray]]:
+        """Yield one computed transform at a time."""
+        offset = 1 if updates_only else 0
+        if any(isinstance(tfm, _BaseLagTransform) for tfm in transforms.values()):
+            core_ga = CoreGroupedArray(self.data, self.indptr)
+        for tfm_name, tfm in transforms.items():
+            if isinstance(tfm, _BaseLagTransform):
+                if updates_only:
+                    yield tfm_name, tfm.update(core_ga)
+                else:
+                    yield tfm_name, tfm.transform(core_ga)
+            else:
+                lag, tfm, *args = tfm
+                yield tfm_name, _transform_series(
+                    self.data, self.indptr, updates_only, lag - offset, tfm, *args
+                )
+
     def apply_transforms(
         self,
         transforms: Mapping[str, Union[Tuple[Any, ...], _BaseLagTransform]],
@@ -75,35 +96,16 @@ class GroupedArray:
 
         If `updates_only` then only the updates are returned.
         """
-        results = {}
-        offset = 1 if updates_only else 0
-        if any(isinstance(tfm, _BaseLagTransform) for tfm in transforms.values()):
-            core_ga = CoreGroupedArray(self.data, self.indptr)
-        for tfm_name, tfm in transforms.items():
-            if isinstance(tfm, _BaseLagTransform):
-                if updates_only:
-                    results[tfm_name] = tfm.update(core_ga)
-                else:
-                    results[tfm_name] = tfm.transform(core_ga)
-            else:
-                lag, tfm, *args = tfm
-                results[tfm_name] = _transform_series(
-                    self.data, self.indptr, updates_only, lag - offset, tfm, *args
-                )
-        return results
+        return dict(self.iter_transforms(transforms=transforms, updates_only=updates_only))
 
-    def apply_multithreaded_transforms(
+    def iter_multithreaded_transforms(
         self,
         transforms: Mapping[str, Union[Tuple[Any, ...], _BaseLagTransform]],
         num_threads: int,
         updates_only: bool = False,
-    ) -> Dict[str, np.ndarray]:
-        """Apply the transformations using multithreading.
-
-        If `updates_only` then only the updates are returned.
-        """
+    ) -> Iterator[Tuple[str, np.ndarray]]:
+        """Yield computed transforms using multithreading."""
         future_to_result = {}
-        results = {}
         offset = 1 if updates_only else 0
         numba_tfms = {}
         core_tfms = {}
@@ -127,15 +129,32 @@ class GroupedArray:
                     future_to_result[future] = tfm_name
                 for future in concurrent.futures.as_completed(future_to_result):
                     tfm_name = future_to_result[future]
-                    results[tfm_name] = future.result()
+                    yield tfm_name, future.result()
         if core_tfms:
             core_ga = CoreGroupedArray(self.data, self.indptr, num_threads)
             for name, tfm in core_tfms.items():
                 if updates_only:
-                    results[name] = tfm.update(core_ga)
+                    yield name, tfm.update(core_ga)
                 else:
-                    results[name] = tfm.transform(core_ga)
-        return results
+                    yield name, tfm.transform(core_ga)
+
+    def apply_multithreaded_transforms(
+        self,
+        transforms: Mapping[str, Union[Tuple[Any, ...], _BaseLagTransform]],
+        num_threads: int,
+        updates_only: bool = False,
+    ) -> Dict[str, np.ndarray]:
+        """Apply the transformations using multithreading.
+
+        If `updates_only` then only the updates are returned.
+        """
+        return dict(
+            self.iter_multithreaded_transforms(
+                transforms=transforms,
+                num_threads=num_threads,
+                updates_only=updates_only,
+            )
+        )
 
     def expand_target(self, max_horizon: int) -> np.ndarray:
         out = np.full_like(

@@ -19,6 +19,8 @@ from mlforecast.core import (
 )
 from mlforecast.lag_transforms import (
     ExpandingMean,
+    ExpandingStd,
+    Lag,
     RollingMean,
     RollingQuantile,
     RollingStd,
@@ -672,6 +674,198 @@ def test_group_lag_transform(engine):
         expected,
         equal_nan=True,
     )
+
+
+@pytest.mark.parametrize("engine", ["pandas", "polars"])
+@pytest.mark.parametrize("dropna", [True, False])
+@pytest.mark.parametrize("as_numpy", [True, False])
+def test_return_xy_matches_preprocess_path(engine, dropna, as_numpy, series):
+    df = series.copy()
+    rng = np.random.default_rng(0)
+    df["price"] = rng.normal(size=len(df)).astype(np.float32)
+    df["promo"] = rng.integers(0, 2, size=len(df), dtype=np.int8)
+    df["weight"] = rng.random(len(df)).astype(np.float32)
+    df = df.sample(frac=1.0, random_state=0).reset_index(drop=True)
+    static_features = ["static_0", "static_1"]
+    if engine == "polars":
+        data = pl.from_pandas(df)
+    else:
+        data = df
+
+    kwargs = dict(
+        freq="1d" if engine == "polars" else "D",
+        lags=[1, 7],
+        lag_transforms={1: [RollingMean(3)], 7: [RollingStd(4)]},
+        date_features=["weekday", "month"],
+    )
+    ts_df = TimeSeries(**kwargs)
+    prep = ts_df.fit_transform(
+        data,
+        id_col="unique_id",
+        time_col="ds",
+        target_col="y",
+        static_features=static_features,
+        dropna=dropna,
+        weight_col="weight",
+    )
+
+    ts_xy = TimeSeries(**kwargs)
+    X, y = ts_xy.fit_transform(
+        data,
+        id_col="unique_id",
+        time_col="ds",
+        target_col="y",
+        static_features=static_features,
+        dropna=dropna,
+        return_X_y=True,
+        as_numpy=as_numpy,
+        weight_col="weight",
+    )
+
+    x_cols = ["weight", *ts_xy.features_order_]
+    expected_X = prep[x_cols] if engine == "pandas" else prep.select(x_cols)
+    expected_y = prep["y"].to_numpy()
+
+    np.testing.assert_allclose(y, expected_y, equal_nan=True)
+    if as_numpy:
+        expected_np = ufp.to_numpy(expected_X)
+        if X.dtype == object or expected_np.dtype == object:
+            pd.testing.assert_frame_equal(pd.DataFrame(X), pd.DataFrame(expected_np))
+        else:
+            np.testing.assert_allclose(X, expected_np, equal_nan=True)
+    elif engine == "pandas":
+        pd.testing.assert_frame_equal(
+            X.reset_index(drop=True),
+            expected_X.reset_index(drop=True),
+        )
+    else:
+        pd.testing.assert_frame_equal(
+            X.to_pandas(),
+            expected_X.to_pandas(),
+        )
+
+
+@pytest.mark.parametrize("engine", ["pandas", "polars"])
+@pytest.mark.parametrize("as_numpy", [True, False])
+def test_return_xy_matches_preprocess_for_global_and_group_features(engine, as_numpy):
+    df = pd.DataFrame(
+        {
+            "unique_id": ["a", "a", "a", "a", "b", "b", "b", "b"],
+            "ds": [1, 2, 3, 4, 1, 2, 3, 4],
+            "y": [1, 2, 3, 4, 10, 20, 30, 40],
+            "brand": ["x", "x", "x", "x", "y", "y", "y", "y"],
+            "weight": np.linspace(1.0, 2.0, 8),
+        }
+    ).sample(frac=1.0, random_state=0).reset_index(drop=True)
+    if engine == "polars":
+        data = pl.from_pandas(df).with_columns(pl.col("unique_id").cast(pl.Categorical))
+    else:
+        data = df
+
+    kwargs = dict(
+        freq=1,
+        lag_transforms={
+            1: [RollingMean(2, global_=True), RollingMean(2, groupby=["brand"])]
+        },
+    )
+    ts_df = TimeSeries(**kwargs)
+    prep = ts_df.fit_transform(
+        data,
+        id_col="unique_id",
+        time_col="ds",
+        target_col="y",
+        dropna=False,
+        static_features=["brand"],
+        weight_col="weight",
+    )
+
+    ts_xy = TimeSeries(**kwargs)
+    X, y = ts_xy.fit_transform(
+        data,
+        id_col="unique_id",
+        time_col="ds",
+        target_col="y",
+        dropna=False,
+        static_features=["brand"],
+        return_X_y=True,
+        as_numpy=as_numpy,
+        weight_col="weight",
+    )
+
+    x_cols = ["weight", *ts_xy.features_order_]
+    expected_X = prep[x_cols] if engine == "pandas" else prep.select(x_cols)
+    expected_y = prep["y"].to_numpy()
+
+    np.testing.assert_allclose(y, expected_y, equal_nan=True)
+    if as_numpy:
+        expected_np = ufp.to_numpy(expected_X)
+        if X.dtype == object or expected_np.dtype == object:
+            pd.testing.assert_frame_equal(pd.DataFrame(X), pd.DataFrame(expected_np))
+        else:
+            np.testing.assert_allclose(X, expected_np, equal_nan=True)
+    elif engine == "pandas":
+        pd.testing.assert_frame_equal(
+            X.reset_index(drop=True),
+            expected_X.reset_index(drop=True),
+        )
+    else:
+        pd.testing.assert_frame_equal(
+            X.to_pandas(),
+            expected_X.to_pandas(),
+        )
+
+
+def test_return_xy_numeric_numpy_is_float32(series):
+    df = series.copy()
+    df["weight"] = np.random.default_rng(0).random(len(df)).astype(np.float32)
+    ts = TimeSeries(
+        freq="D",
+        lags=[1, 7],
+        lag_transforms={1: [RollingMean(3), RollingStd(3)]},
+        date_features=["weekday", "month"],
+    )
+    X, _ = ts.fit_transform(
+        df,
+        id_col="unique_id",
+        time_col="ds",
+        target_col="y",
+        static_features=["static_0", "static_1"],
+        return_X_y=True,
+        as_numpy=True,
+        weight_col="weight",
+    )
+    assert X.dtype == np.float32
+
+
+def test_return_xy_numeric_numpy_can_force_float64(series):
+    df = series.copy()
+    df["weight"] = np.random.default_rng(0).random(len(df)).astype(np.float32)
+    ts = TimeSeries(
+        freq="D",
+        lags=[1, 7],
+        lag_transforms={1: [RollingMean(3), RollingStd(3)]},
+        date_features=["weekday", "month"],
+    )
+    X, _ = ts.fit_transform(
+        df,
+        id_col="unique_id",
+        time_col="ds",
+        target_col="y",
+        static_features=["static_0", "static_1"],
+        return_X_y=True,
+        as_numpy=True,
+        as_numpy_dtype=np.float64,
+        weight_col="weight",
+    )
+    assert X.dtype == np.float64
+
+
+def test_builtin_lag_transform_head_nulls():
+    assert Lag(2).head_nulls == 2
+    assert ExpandingMean()._set_core_tfm(1).head_nulls == 1
+    assert ExpandingStd()._set_core_tfm(1).head_nulls == 2
+    assert RollingMean(3)._set_core_tfm(1).head_nulls == 3
+    assert RollingStd(3, min_samples=1)._set_core_tfm(1).head_nulls == 2
 
 
 @pytest.mark.parametrize("engine", ["pandas", "polars"])

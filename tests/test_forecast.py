@@ -764,22 +764,27 @@ def test_polars_pandas_compatibility(polars_pandas_test_data, max_horizon, as_nu
     # Skip as_numpy=False for now due to LightGBM/Polars compatibility issues
     if not as_numpy:
         pytest.skip("LightGBM with polars DataFrames not fully supported yet")
+    fit_kwargs = data['fit_kwargs'].copy()
+    cv_kwargs = data['cv_kwargs'].copy()
+    if as_numpy:
+        fit_kwargs['as_numpy_dtype'] = np.float64
+        cv_kwargs['as_numpy_dtype'] = np.float64
 
     fcst_pl = MLForecast(**data['cfg_pl'])
-    fcst_pl.fit(data['series_pl'], max_horizon=max_horizon, as_numpy=as_numpy, **data['fit_kwargs'])
+    fcst_pl.fit(data['series_pl'], max_horizon=max_horizon, as_numpy=as_numpy, **fit_kwargs)
     fitted_pl = fcst_pl.forecast_fitted_values()
     preds_pl = fcst_pl.predict(X_df=data['prices_pl'], **data['predict_kwargs'])
     preds_pl_subset = fcst_pl.predict(X_df=data['prices_pl'], ids=fcst_pl.ts.uids[[0, 6]], **data['predict_kwargs'])
-    cv_pl = fcst_pl.cross_validation(data['series_pl'], as_numpy=as_numpy, **data['cv_kwargs'])
+    cv_pl = fcst_pl.cross_validation(data['series_pl'], as_numpy=as_numpy, **cv_kwargs)
     cv_fitted_pl = fcst_pl.cross_validation_fitted_values()
 
     fcst_pd = MLForecast(**data['cfg_pd'])
-    fcst_pd.fit(data['series_pd'], max_horizon=max_horizon, as_numpy=as_numpy, **data['fit_kwargs'])
+    fcst_pd.fit(data['series_pd'], max_horizon=max_horizon, as_numpy=as_numpy, **fit_kwargs)
     fitted_pd = fcst_pd.forecast_fitted_values()
     preds_pd = fcst_pd.predict(X_df=data['prices_pd'], **data['predict_kwargs'])
     preds_pd_subset = fcst_pd.predict(X_df=data['prices_pd'], ids=fcst_pd.ts.uids[[0, 6]], **data['predict_kwargs'])
     assert preds_pd_subset['unique_id'].unique().tolist() == ['id_0', 'id_6']
-    cv_pd = fcst_pd.cross_validation(data['series_pd'], as_numpy=as_numpy, **data['cv_kwargs'])
+    cv_pd = fcst_pd.cross_validation(data['series_pd'], as_numpy=as_numpy, **cv_kwargs)
     cv_fitted_pd = fcst_pd.cross_validation_fitted_values()
 
     if max_horizon is not None:
