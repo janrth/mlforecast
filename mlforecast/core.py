@@ -45,9 +45,15 @@ from mlforecast.target_transforms import (
     _BaseGroupedArrayTargetTransform,
 )
 
+from .compat import CatBoostRegressor
 from .grouped_array import GroupedArray
 from .lag_transforms import Lag, _BaseLagTransform
-from .utils import _ShortSeriesException, _resolve_num_threads
+from .utils import (
+    _DUMMY_FEATURE_VALUES,
+    _ShortSeriesException,
+    _compute_date_dummies,
+    _resolve_num_threads,
+)
 
 date_features_dtypes = {
     "year": np.uint16,
@@ -214,8 +220,11 @@ class TimeSeries:
         num_threads: int = 1,
         target_transforms: Optional[List[TargetTransform]] = None,
         lag_transforms_namer: Optional[Callable] = None,
+        date_features_as_dummies: bool = False,
+        drop_auxiliary_columns: Union[bool, Sequence[str]] = True,
     ):
         self.freq = freq
+        self.date_features_as_dummies = date_features_as_dummies
         num_threads = _resolve_num_threads(num_threads)
         if not isinstance(num_threads, int) or num_threads < 1:
             warnings.warn("Setting num_threads to 1.")
@@ -241,6 +250,7 @@ class TimeSeries:
                     "Can't use a lambda as a date feature because the function name gets used as the feature name."
                 )
         self.lag_transforms_namer = lag_transforms_namer
+        self.drop_auxiliary_columns = drop_auxiliary_columns
         self.transforms = _parse_transforms(
             lags=self.lags,
             lag_transforms=self.lag_transforms,
@@ -358,13 +368,14 @@ class TimeSeries:
             bucket_df = df[key_cols + [self.time_col, self.target_col]]
             bucket_df = ufp.sort(bucket_df, by=key_cols + [self.time_col])
             return ufp.drop_index_if_pandas(bucket_df)
-        bucket_df = ufp.group_by_agg(
-            df[key_cols + [self.time_col, self.target_col]],
-            key_cols + [self.time_col],
-            {self.target_col: "sum"},
-            maintain_order=True,
+        # Keep individual rows (one per original series observation) so the transform
+        # sees each observation separately rather than a timestamp-level aggregate.
+        # id_col is included to enable a unique (id_col, time_col) join-back.
+        keep_cols = _dedupe_preserve_order(
+            [self.id_col] + key_cols + [self.time_col, self.target_col]
         )
-        bucket_df = ufp.sort(bucket_df, by=key_cols + [self.time_col])
+        bucket_df = df[keep_cols]
+        bucket_df = ufp.sort(bucket_df, by=key_cols + [self.time_col, self.id_col])
         return ufp.drop_index_if_pandas(bucket_df)
 
     def _add_bucket_id(
@@ -508,19 +519,54 @@ class TimeSeries:
             old_n_buckets = len(state["groups"])
             bucket_ids = self._ensure_partition_bucket_ids(state, keys_df)
             new_n_buckets = len(state["groups"])
-            bucket_sums = np.zeros(new_n_buckets, dtype=self.ga.data.dtype)
-            new_sizes = np.zeros(new_n_buckets, dtype=np.int32)
-            np.add.at(bucket_sums, bucket_ids, new_arr)
-            new_sizes[np.unique(bucket_ids)] = 1
             new_groups = np.zeros(new_n_buckets, dtype=bool)
             if new_n_buckets > old_n_buckets:
                 new_groups[old_n_buckets:] = True
-            new_values = bucket_sums[new_sizes.astype(bool)]
+            if state["mode"] == "local":
+                bucket_sums = np.zeros(new_n_buckets, dtype=self.ga.data.dtype)
+                new_sizes = np.zeros(new_n_buckets, dtype=np.int32)
+                np.add.at(bucket_sums, bucket_ids, new_arr)
+                new_sizes[np.unique(bucket_ids)] = 1
+                new_values = bucket_sums[new_sizes.astype(bool)]
+            else:
+                # Append each series value individually; sort by bucket_id so
+                # new_values is laid out bucket-by-bucket for append_several.
+                sort_order = np.argsort(bucket_ids, kind="stable")
+                new_values = new_arr[sort_order]
+                new_sizes = np.zeros(new_n_buckets, dtype=np.int32)
+                np.add.at(new_sizes, bucket_ids[sort_order], 1)
             state["ga"] = state["ga"].append_several(
                 new_sizes=new_sizes,
                 new_values=new_values,
                 new_groups=new_groups,
             )
+
+    def _initialize_lag_transform_states(self) -> None:
+        """Materialize lag transform state for subsequent update-based prediction.
+
+        This is needed when a new ``TimeSeries`` instance is created from historical
+        data right before calling ``predict(new_df=...)``. Local, global and grouped
+        transforms all need to see a full ``transform`` pass so stateful transforms
+        like ``ExpandingMean`` can initialize their internal buffers before the
+        first ``update(...)`` call.
+        """
+        core_tfms = self._get_core_lag_tfms()
+        if core_tfms:
+            self._compute_transforms(core_tfms, updates_only=False)
+        global_tfms = self._get_global_tfms()
+        if global_tfms:
+            if self._global_ga is None:
+                raise RuntimeError(
+                    "Global lag transform state is missing. This is likely a bug; please open an issue."
+                )
+            self._global_ga.apply_transforms(
+                transforms=global_tfms, updates_only=False
+            )
+        group_tfms = self._get_group_tfms()
+        if group_tfms:
+            for group_cols, tfms in group_tfms.items():
+                state = self._group_states[group_cols]
+                state["ga"].apply_transforms(transforms=tfms, updates_only=False)
 
     def _check_aligned_ends(self) -> None:
         """Check that all series end at the same timestamp when using global/group transforms."""
@@ -540,8 +586,18 @@ class TimeSeries:
             )
 
     @property
-    def _date_feature_names(self):
-        return [f.__name__ if callable(f) else f for f in self.date_features]
+    def _date_feature_names(self) -> List[str]:
+        names: List[str] = []
+        for f in self.date_features:
+            if (self.date_features_as_dummies
+                    and isinstance(f, str)
+                    and f in _DUMMY_FEATURE_VALUES):
+                names.extend(f"{f}_{v}" for v in _DUMMY_FEATURE_VALUES[f])
+            elif callable(f):
+                names.append(f.__name__)
+            else:
+                names.append(f)
+        return names
 
     @property
     def features(self) -> List[str]:
@@ -552,7 +608,10 @@ class TimeSeries:
         """Identify user-provided exogenous columns that need time-alignment."""
         static_cols = set(self.static_features_.columns)
         lag_cols = set(self.transforms.keys())
-        date_cols = {f.__name__ if callable(f) else f for f in self.date_features}
+        date_cols = set(self._date_feature_names) | {
+            f for f in self.date_features
+            if self.date_features_as_dummies and isinstance(f, str) and f in _DUMMY_FEATURE_VALUES
+        }
         exclude = static_cols | lag_cols | date_cols | {self.id_col, self.time_col, self.target_col}
         if self.weight_col is not None:
             exclude.add(self.weight_col)
@@ -720,16 +779,36 @@ class TimeSeries:
                     "are dynamic please set `static_features=[]`."
                 )
         self.static_features_ = statics_on_ends
-        self.features_order_ = [c for c in df.columns if c not in to_drop] + [
+        raw_date_sources = {
+            f for f in self.date_features
+            if self.date_features_as_dummies and isinstance(f, str) and f in _DUMMY_FEATURE_VALUES
+        }
+        self.features_order_ = [c for c in df.columns if c not in to_drop and c not in raw_date_sources] + [
             f for f in self.features if f not in df.columns
         ]
+        if self.drop_auxiliary_columns is True:
+            to_exclude = {
+                col
+                for tfm in self.transforms.values()
+                if isinstance(tfm, _BaseLagTransform)
+                for col in (getattr(tfm, "groupby", None) or [])
+            }
+        elif self.drop_auxiliary_columns is False:
+            to_exclude = set()
+        else:
+            to_exclude = set(self.drop_auxiliary_columns)
+            unknown = [f for f in to_exclude if f not in self.features_order_]
+            if unknown:
+                warnings.warn(
+                    f"The following drop_auxiliary_columns were not found in the feature set: {unknown}",
+                    UserWarning,
+                )
+        self.features_order_ = [f for f in self.features_order_ if f not in to_exclude]
         df_for_special = df
         if self.target_transforms is not None and (partition_tfms or group_tfms):
             transformed_target = ga.data
             if self._restore_idxs is not None:
                 transformed_target = transformed_target[self._restore_idxs]
-            # Keep the caller's dataframe untouched when building aggregated or
-            # partitioned states from the transformed target.
             df_for_special = ufp.copy_if_pandas(df, deep=True)
             df_for_special = ufp.assign_columns(
                 df_for_special, target_col, transformed_target
@@ -761,14 +840,33 @@ class TimeSeries:
                     mode, group_cols, partition_cols
                 )
                 bucket_df, groups = self._add_bucket_id(bucket_df, key_cols)
-                if isinstance(bucket_df, pd.DataFrame):
-                    process_df = bucket_df[["_bucket_id", time_col, target_col]]
+                if mode != "local":
+                    # Timestamps can repeat within a bucket (multiple series at same ds),
+                    # so use a sequential position per bucket as the time dimension.
+                    if isinstance(bucket_df, pd.DataFrame):
+                        bucket_df = bucket_df.copy()
+                        bucket_df["_bucket_pos"] = (
+                            bucket_df.groupby("_bucket_id", sort=False)
+                            .cumcount()
+                            .astype(np.int64)
+                        )
+                    else:
+                        bucket_df = bucket_df.with_columns(
+                            pl.int_range(pl.len()).over("_bucket_id").alias("_bucket_pos")
+                        )
+                    proc_time_col = "_bucket_pos"
+                    join_cols = [self.id_col, time_col]
                 else:
-                    process_df = bucket_df.select(["_bucket_id", time_col, target_col])
+                    proc_time_col = time_col
+                    join_cols = key_cols + [time_col]
+                if isinstance(bucket_df, pd.DataFrame):
+                    process_df = bucket_df[["_bucket_id", proc_time_col, target_col]]
+                else:
+                    process_df = bucket_df.select(["_bucket_id", proc_time_col, target_col])
                 processed = ufp.process_df(
                     process_df,
                     id_col="_bucket_id",
-                    time_col=time_col,
+                    time_col=proc_time_col,
                     target_col=target_col,
                 )
                 if processed.sort_idxs is not None:
@@ -779,6 +877,7 @@ class TimeSeries:
                     "group_cols": list(group_cols),
                     "partition_cols": list(partition_cols),
                     "key_cols": key_cols,
+                    "join_cols": join_cols,
                     "tfms": tfms,
                     "ga": GroupedArray(processed.data[:, 0], processed.indptr),
                     "df": bucket_df,
@@ -878,24 +977,36 @@ class TimeSeries:
             )
         return out
 
-    def _compute_date_feature(self, dates, feature):
+    def _compute_date_feature(self, dates, feature) -> Dict[str, Any]:
+        """Compute date feature(s) and return as a ``{col_name: values}`` dict."""
+        if (self.date_features_as_dummies
+                and isinstance(feature, str)
+                and feature in _DUMMY_FEATURE_VALUES):
+            return _compute_date_dummies(dates, feature)
+
         if callable(feature):
             feat_name = feature.__name__
             feat_vals = feature(dates)
+            if isinstance(feat_vals, pd.DataFrame):
+                return {col: np.asarray(feat_vals[col]) for col in feat_vals.columns}
+            if isinstance(feat_vals, (pd.Index, pd.Series)):
+                feat_vals = np.asarray(feat_vals)
+            return {feat_name: feat_vals}
+
+        # regular string feature
+        feat_name = feature
+        if isinstance(dates, pd.DatetimeIndex):
+            if feature in ("week", "weekofyear"):
+                dates = dates.isocalendar()
+            feat_vals = getattr(dates, feature)
+            if isinstance(feat_vals, (pd.Index, pd.Series)):
+                feat_vals = np.asarray(feat_vals)
+                feat_dtype = date_features_dtypes.get(feature)
+                if feat_dtype is not None:
+                    feat_vals = feat_vals.astype(feat_dtype)
         else:
-            feat_name = feature
-            if isinstance(dates, pd.DatetimeIndex):
-                if feature in ("week", "weekofyear"):
-                    dates = dates.isocalendar()
-                feat_vals = getattr(dates, feature)
-            else:
-                feat_vals = getattr(dates.dt, feature)()
-        if isinstance(feat_vals, (pd.Index, pd.Series)):
-            feat_vals = np.asarray(feat_vals)
-            feat_dtype = date_features_dtypes.get(feature)
-            if feat_dtype is not None:
-                feat_vals = feat_vals.astype(feat_dtype)
-        return feat_name, feat_vals
+            feat_vals = getattr(dates.dt, feature)()
+        return {feat_name: feat_vals}
 
     def _transform(
         self,
@@ -979,26 +1090,68 @@ class TimeSeries:
         if self._partition_states:
             for state in self._partition_states.values():
                 bucket_df = state["df"]
-                bucket_vals = state["ga"].apply_transforms(
-                    transforms=state["tfms"], updates_only=False
-                )
-                key_cols = state["key_cols"]
+                mode = state["mode"]
+                tfms = state["tfms"]
+                bucket_vals: Dict[str, np.ndarray] = {}
+                if mode != "local":
+                    # Dispatch each transform via _compute_bucket_feature.
+                    # Transforms that implement that method (e.g. _RollingBase) return
+                    # their own RANGE-based feature array directly.  Transforms that
+                    # return None fall back to position-based GroupedArray computation
+                    # followed by same-timestamp correction: all observations sharing
+                    # (bucket_id, ts) receive the first-position value, which was
+                    # computed from strictly earlier timestamps only.
+                    bid_arr = bucket_df["_bucket_id"].to_numpy()
+                    ts_arr = bucket_df[self.time_col].to_numpy()
+                    y_arr = bucket_df[self.target_col].to_numpy().astype(float)
+                    fallback_tfms = {}
+                    for name, tfm in tfms.items():
+                        if isinstance(tfm, _BaseLagTransform):
+                            computed = tfm._compute_bucket_feature(bid_arr, ts_arr, y_arr)
+                            if computed is not None:
+                                bucket_vals[name] = computed
+                                continue
+                        fallback_tfms[name] = tfm
+                    if fallback_tfms:
+                        pos_vals = state["ga"].apply_transforms(
+                            transforms=fallback_tfms, updates_only=False
+                        )
+                        for name in list(pos_vals):
+                            vals = pos_vals[name].copy()
+                            i, n_rows = 0, len(vals)
+                            while i < n_rows:
+                                j = i + 1
+                                while (
+                                    j < n_rows
+                                    and bid_arr[j] == bid_arr[i]
+                                    and ts_arr[j] == ts_arr[i]
+                                ):
+                                    j += 1
+                                if j > i + 1:
+                                    vals[i + 1 : j] = vals[i]
+                                i = j
+                            bucket_vals[name] = vals
+                else:
+                    bucket_vals = state["ga"].apply_transforms(
+                        transforms=tfms, updates_only=False
+                    )
+                join_cols = state["join_cols"]
                 feature_cols = list(bucket_vals.keys())
                 if isinstance(df, pd.DataFrame):
-                    join_df = bucket_df[key_cols + [self.time_col]].copy()
+                    join_df = bucket_df[join_cols].copy()
                     for name, vals in bucket_vals.items():
                         join_df[name] = vals
-                    joined = df[key_cols + [self.time_col]].merge(
-                        join_df, on=key_cols + [self.time_col], how="left"
+                    joined = df[join_cols].merge(
+                        join_df, on=join_cols, how="left"
                     )
                     for name in feature_cols:
                         features[name] = joined[name].to_numpy()
                 else:
-                    join_df = bucket_df.select(key_cols + [self.time_col])
+                    join_df = bucket_df.select(join_cols)
                     for name, vals in bucket_vals.items():
                         join_df = join_df.with_columns(pl.Series(name=name, values=vals))
-                    joined = df.select(key_cols + [self.time_col]).join(
-                        join_df, on=key_cols + [self.time_col], how="left"
+                    joined = df.select(join_cols).join(
+                        join_df, on=join_cols, how="left"
                     )
                     for name in feature_cols:
                         features[name] = joined[name].to_numpy()
@@ -1078,9 +1231,19 @@ class TimeSeries:
                 df = ufp.assign_columns(df, feat, features[feat])
 
         # date features
-        names = [f.__name__ if callable(f) else f for f in self.date_features]
+        def _feature_in_df(f, cols):
+            if (self.date_features_as_dummies
+                    and isinstance(f, str)
+                    and f in _DUMMY_FEATURE_VALUES):
+                return all(
+                    f"{f}_{v}" in cols for v in _DUMMY_FEATURE_VALUES[f]
+                )
+            name = f.__name__ if callable(f) else f
+            return name in cols
+
+        df_cols = set(df.columns)
         date_features = [
-            f for f, name in zip(self.date_features, names) if name not in df
+            f for f in self.date_features if not _feature_in_df(f, df_cols)
         ]
         if date_features:
             unique_dates = df[self.time_col].unique()
@@ -1090,16 +1253,30 @@ class TimeSeries:
                 date2pos = {date: i for i, date in enumerate(unique_dates)}
                 restore_idxs = df[self.time_col].map(date2pos)
                 for feature in date_features:
-                    feat_name, feat_vals = self._compute_date_feature(
+                    for feat_name, feat_vals in self._compute_date_feature(
                         unique_dates, feature
-                    )
-                    df[feat_name] = feat_vals[restore_idxs]
+                    ).items():
+                        df[feat_name] = feat_vals[restore_idxs]
             elif isinstance(df, pl_DataFrame):
                 exprs = []
+                nw_feats: Dict[str, Any] = {}
                 for feat in date_features:  # type: ignore
-                    name, vals = self._compute_date_feature(pl.col(self.time_col), feat)
-                    exprs.append(vals.alias(name))
-                feats = unique_dates.to_frame().with_columns(*exprs)
+                    if (self.date_features_as_dummies
+                            and isinstance(feat, str)
+                            and feat in _DUMMY_FEATURE_VALUES):
+                        nw_feats.update(_compute_date_dummies(unique_dates, feat))
+                    else:
+                        for name, vals in self._compute_date_feature(
+                            pl.col(self.time_col), feat
+                        ).items():
+                            exprs.append(vals.alias(name))
+                feats = unique_dates.to_frame()
+                if exprs:
+                    feats = feats.with_columns(*exprs)
+                for col_name, col_vals in nw_feats.items():
+                    feats = feats.with_columns(
+                        pl.Series(name=col_name, values=col_vals)
+                    )
                 df = df.join(feats, on=self.time_col, how="left")
 
         # assemble return
@@ -1353,8 +1530,10 @@ class TimeSeries:
         features.update(self._compute_partition_features(step_df))
 
         for feature in self.date_features:
-            feat_name, feat_vals = self._compute_date_feature(self.curr_dates, feature)
-            features[feat_name] = feat_vals
+            for feat_name, feat_vals in self._compute_date_feature(
+                self.curr_dates, feature
+            ).items():
+                features[feat_name] = feat_vals
 
         if isinstance(self.last_dates, pl_Series):
             df_constructor = pl_DataFrame
@@ -1476,7 +1655,10 @@ class TimeSeries:
                     new_x = self._get_features_for_next_step(X_df)
                     if before_predict_callback is not None:
                         new_x = before_predict_callback(new_x)
-                    predictions = model.predict(new_x)
+                    model_x = new_x
+                    if isinstance(model, CatBoostRegressor) and isinstance(new_x, pl_DataFrame):
+                        model_x = new_x.to_pandas()
+                    predictions = model.predict(model_x)
                     if after_predict_callback is not None:
                         predictions = after_predict_callback(predictions)
                     self._update_y(predictions)
@@ -1603,6 +1785,8 @@ class TimeSeries:
                             )
                             model_x = new_x[h_cols]
                     horizon_model = model[h]
+                    if isinstance(horizon_model, CatBoostRegressor) and isinstance(model_x, pl_DataFrame):
+                        model_x = model_x.to_pandas()
                     preds = horizon_model.predict(model_x)
                     if len(preds) != len(self.uids):
                         raise ValueError(f"Model returned {len(preds)} predictions but expected {len(self.uids)}")
@@ -2021,7 +2205,7 @@ class TimeSeries:
                     bucket_df = bucket_df.with_columns(
                         pl.Series(name="_bucket_id", values=bucket_ids)
                     )
-                bucket_df = ufp.sort(bucket_df, by=["_bucket_id", self.time_col])
+                bucket_df = ufp.sort(bucket_df, by=["_bucket_id", self.time_col, self.id_col])
                 id_counts = ufp.counts_by_id(bucket_df, "_bucket_id")
                 if isinstance(state["groups"], pd.DataFrame):
                     all_ids = state["groups"][["_bucket_id"]].copy()
