@@ -316,26 +316,66 @@ class AutoMLForecast:
         id_col: str,
         target_col: str,
         model_col: str,
+        key_cols: Optional[List[str]] = None,
     ) -> pd.DataFrame:
+        key_cols = [id_col, *(key_cols or [])]
         errors = cv_df[model_col] - cv_df[target_col]
         bias_by_cutoff = (
             cv_df.assign(_bias=errors)
-            .groupby([id_col, "cutoff"], observed=True)["_bias"]
+            .groupby(key_cols + ["cutoff"], observed=True)["_bias"]
             .mean()
             .reset_index()
         )
         id_signs = (
-            bias_by_cutoff.groupby(id_col, observed=True)["_bias"]
+            bias_by_cutoff.groupby(key_cols, observed=True)["_bias"]
             .agg(["min", "max"])
             .reset_index()
         )
-        underforecast_ids = id_signs.loc[id_signs["max"] < 0, [id_col]].assign(
+        underforecast_ids = id_signs.loc[id_signs["max"] < 0, key_cols].assign(
             direction="hi"
         )
-        overforecast_ids = id_signs.loc[id_signs["min"] > 0, [id_col]].assign(
+        overforecast_ids = id_signs.loc[id_signs["min"] > 0, key_cols].assign(
             direction="lo"
         )
         return pd.concat([underforecast_ids, overforecast_ids], ignore_index=True)
+
+    def _add_weekday_column(
+        self,
+        df: DataFrame,
+        time_col: str,
+        col_name: str = "_weekday",
+    ) -> DataFrame:
+        if isinstance(df, pd.DataFrame):
+            df = df.copy()
+            time_values = df[time_col]
+            if pd.api.types.is_datetime64_any_dtype(time_values):
+                parsed = time_values
+            elif pd.api.types.is_object_dtype(time_values) or pd.api.types.is_string_dtype(
+                time_values
+            ):
+                parsed = pd.to_datetime(time_values, errors="raise")
+            else:
+                raise ValueError(
+                    "weekday-based percentile correction requires a datetime-like time_col."
+                )
+            df[col_name] = parsed.dt.dayofweek.astype(int)
+            return df
+        dtype = df.schema[time_col]
+        if dtype in (pl.Date, pl.Datetime):
+            expr = (pl.col(time_col).dt.weekday() - 1).cast(pl.Int64)
+        elif dtype in (pl.Utf8, getattr(pl, "String", pl.Utf8)):
+            expr = (
+                pl.col(time_col)
+                .str.to_datetime(strict=False)
+                .dt.weekday()
+                .sub(1)
+                .cast(pl.Int64)
+            )
+        else:
+            raise ValueError(
+                "weekday-based percentile correction requires a datetime-like time_col."
+            )
+        return df.with_columns(expr.alias(col_name))
 
     def _select_percentiles_to_reduce_bias(
         self,
@@ -344,10 +384,12 @@ class AutoMLForecast:
         id_col: str,
         target_col: str,
         model_col: str,
+        key_cols: Optional[List[str]] = None,
     ) -> Dict[Any, Dict[str, Any]]:
         if systematic_bias_ids.empty:
             return {}
-        cv_df = cv_df.merge(systematic_bias_ids, on=id_col, how="inner")
+        key_cols = [id_col, *(key_cols or [])]
+        cv_df = cv_df.merge(systematic_bias_ids, on=key_cols, how="inner")
         hi_rows = cv_df["direction"].eq("hi")
         lo_rows = cv_df["direction"].eq("lo")
         best_by_id: Dict[Any, Dict[str, Any]] = {}
@@ -359,11 +401,15 @@ class AutoMLForecast:
                 continue
             if hi_rows.any():
                 hi_bias = (
-                    (cv_df.loc[hi_rows, hi_col] - cv_df.loc[hi_rows, target_col])
-                    .groupby(cv_df.loc[hi_rows, id_col], observed=True)
+                    cv_df.loc[hi_rows, key_cols + [hi_col, target_col]]
+                    .assign(_bias=lambda df: df[hi_col] - df[target_col])
+                    .groupby(key_cols, observed=True)["_bias"]
                     .mean()
+                    .reset_index()
                 )
-                for uid, bias in hi_bias.items():
+                for values in hi_bias.itertuples(index=False, name=None):
+                    *key_values, bias = values
+                    uid = key_values[0] if len(key_values) == 1 else tuple(key_values)
                     abs_bias = abs(float(bias))
                     current = best_by_id.get(uid)
                     if current is None or abs_bias < current["abs_bias"]:
@@ -374,11 +420,15 @@ class AutoMLForecast:
                         }
             if lo_rows.any():
                 lo_bias = (
-                    (cv_df.loc[lo_rows, lo_col] - cv_df.loc[lo_rows, target_col])
-                    .groupby(cv_df.loc[lo_rows, id_col], observed=True)
+                    cv_df.loc[lo_rows, key_cols + [lo_col, target_col]]
+                    .assign(_bias=lambda df: df[lo_col] - df[target_col])
+                    .groupby(key_cols, observed=True)["_bias"]
                     .mean()
+                    .reset_index()
                 )
-                for uid, bias in lo_bias.items():
+                for values in lo_bias.itertuples(index=False, name=None):
+                    *key_values, bias = values
+                    uid = key_values[0] if len(key_values) == 1 else tuple(key_values)
                     abs_bias = abs(float(bias))
                     current = best_by_id.get(uid)
                     if current is None or abs_bias < current["abs_bias"]:
@@ -398,6 +448,7 @@ class AutoMLForecast:
         metric: str,
         metric_kwargs: Optional[Dict[str, Any]],
         cutoff_col: str,
+        key_cols: Optional[List[str]] = None,
     ) -> Dict[Any, Dict[str, Any]]:
         metric_key = metric.lower()
         if metric_key == "abs_bias":
@@ -415,6 +466,14 @@ class AutoMLForecast:
         df_for_metric = cv_df
         if cutoff_col in cv_df.columns:
             df_for_metric = cv_df.drop(columns=[cutoff_col])
+        key_cols = [id_col, *(key_cols or [])]
+        metric_id_col = id_col
+        if len(key_cols) > 1:
+            df_for_metric = df_for_metric.copy()
+            df_for_metric["_metric_key"] = list(
+                zip(*(df_for_metric[col].to_numpy() for col in key_cols))
+            )
+            metric_id_col = "_metric_key"
 
         cols: List[str] = []
         col_meta: Dict[str, Dict[str, Any]] = {}
@@ -429,7 +488,7 @@ class AutoMLForecast:
 
         call_kwargs = {"df": df_for_metric, "models": cols}
         if "id_col" in metric_params:
-            call_kwargs["id_col"] = id_col
+            call_kwargs["id_col"] = metric_id_col
         if "target_col" in metric_params:
             call_kwargs["target_col"] = target_col
         for key, value in metric_kwargs.items():
@@ -439,17 +498,27 @@ class AutoMLForecast:
         if metric_key == "abs_bias":
             metrics_df[cols] = metrics_df[cols].abs()
 
-        metrics_df = metrics_df.set_index(id_col)
+        if not isinstance(metrics_df, pd.DataFrame):
+            metrics_df = pd.DataFrame(metrics_df)
+        if metric_id_col not in metrics_df.columns and metrics_df.index.name == metric_id_col:
+            metrics_df = metrics_df.reset_index()
+        if metric_id_col not in metrics_df.columns:
+            raise ValueError(f"Expected {metric_id_col} column in metric output.")
+        metrics_df = metrics_df.set_index(metric_id_col)
         min_col = metrics_df[cols].idxmin(axis=1)
         min_val = metrics_df[cols].min(axis=1)
-        for uid, col in min_col.items():
+        for uid, col, value in zip(
+            min_col.index.tolist(),
+            min_col.tolist(),
+            min_val.tolist(),
+        ):
             meta = col_meta.get(col)
             if meta is None:
                 continue
             best_by_id[uid] = {
                 "side": meta["side"],
                 "percentile": meta["percentile"],
-                "metric": float(min_val.loc[uid]),
+                "metric": float(value),
             }
         return best_by_id
 
@@ -586,14 +655,24 @@ class AutoMLForecast:
         cutoff_col: str,
         strict_bias: bool,
         per_horizon: bool,
+        by_weekday: bool,
     ) -> Dict[str, Any]:
         if not self.percentile_correction_levels_:
-            return {"id_to_col": {}, "levels": []}
+            return {
+                "id_to_col": {},
+                "levels": [],
+                "by_horizon": False,
+                "by_weekday": by_weekday,
+            }
         mode = correction_mode.lower()
         metric_key = correction_metric.lower()
 
         if per_horizon and mode != "metric":
             raise ValueError("per_horizon correction is only supported in metric mode.")
+        if per_horizon and by_weekday:
+            raise ValueError(
+                "weekday-based percentile correction can't be combined with per_horizon correction."
+            )
         if mode == "metric":
             intervals_init_params = copy.deepcopy(mlf_init_params)
             intervals_fit_params = copy.deepcopy(mlf_fit_params)
@@ -618,6 +697,8 @@ class AutoMLForecast:
                 **intervals_fit_params,
             )
             intervals_cv_pd = self._to_pandas(intervals_cv)
+            if by_weekday:
+                intervals_cv_pd = self._add_weekday_column(intervals_cv_pd, time_col)
             if per_horizon:
                 best_by_id = self._select_percentiles_by_metric_per_horizon(
                     cv_df=intervals_cv_pd,
@@ -638,15 +719,26 @@ class AutoMLForecast:
                     metric=metric_key,
                     metric_kwargs=correction_metric_kwargs,
                     cutoff_col=cutoff_col,
+                    key_cols=["_weekday"] if by_weekday else None,
                 )
             if not best_by_id:
-                return {"id_to_col": {}, "levels": []}
+                return {
+                    "id_to_col": {},
+                    "levels": [],
+                    "by_horizon": per_horizon,
+                    "by_weekday": by_weekday,
+                }
             id_to_col = {
                 key: f"{model_name}-{info['side']}-{info['percentile']}"
                 for key, info in best_by_id.items()
             }
             levels = sorted({info["percentile"] for info in best_by_id.values()})
-            return {"id_to_col": id_to_col, "levels": levels, "by_horizon": per_horizon}
+            return {
+                "id_to_col": id_to_col,
+                "levels": levels,
+                "by_horizon": per_horizon,
+                "by_weekday": by_weekday,
+            }
 
         base_init_params = copy.deepcopy(mlf_init_params)
         base_fit_params = copy.deepcopy(mlf_fit_params)
@@ -669,31 +761,41 @@ class AutoMLForecast:
             **base_fit_params,
         )
         base_cv_pd = self._to_pandas(base_cv)
+        if by_weekday:
+            base_cv_pd = self._add_weekday_column(base_cv_pd, time_col)
+        extra_key_cols = ["_weekday"] if by_weekday else None
         if strict_bias:
             systematic_bias_ids = self._find_systematic_bias_ids(
                 cv_df=base_cv_pd,
                 id_col=id_col,
                 target_col=target_col,
                 model_col="model",
+                key_cols=extra_key_cols,
             )
         else:
+            bias_key_cols = [id_col, *(extra_key_cols or [])]
+            bias_df = base_cv_pd[bias_key_cols].copy()
+            bias_df["bias"] = base_cv_pd["model"] - base_cv_pd[target_col]
             bias = (
-                base_cv_pd["model"] - base_cv_pd[target_col]
-            ).groupby(base_cv_pd[id_col], observed=True).mean()
-            bias = bias.rename("bias")
+                bias_df.groupby(bias_key_cols, observed=True)["bias"]
+                .mean()
+                .reset_index()
+            )
             systematic_bias_ids = (
-                bias.reset_index()
-                .assign(
-                    direction=lambda df: np.where(df["bias"] < 0, "hi", "lo")
-                )
+                bias.assign(direction=lambda df: np.where(df["bias"] < 0, "hi", "lo"))
             )
             systematic_bias_ids = systematic_bias_ids[systematic_bias_ids["bias"] != 0][
-                [id_col, "direction"]
+                bias_key_cols + ["direction"]
             ]
         if systematic_bias_ids.empty:
-            return {"id_to_col": {}, "levels": []}
+            return {
+                "id_to_col": {},
+                "levels": [],
+                "by_horizon": False,
+                "by_weekday": by_weekday,
+            }
 
-        ids = systematic_bias_ids[id_col].tolist()
+        ids = systematic_bias_ids[id_col].drop_duplicates().tolist()
         id_mask = ufp.is_in(df[id_col], ids)
         filtered_df = ufp.filter_with_mask(df, id_mask)
 
@@ -720,21 +822,34 @@ class AutoMLForecast:
             **intervals_fit_params,
         )
         intervals_cv_pd = self._to_pandas(intervals_cv)
+        if by_weekday:
+            intervals_cv_pd = self._add_weekday_column(intervals_cv_pd, time_col)
         best_by_id = self._select_percentiles_to_reduce_bias(
             cv_df=intervals_cv_pd,
             systematic_bias_ids=systematic_bias_ids,
             id_col=id_col,
             target_col=target_col,
             model_col="model",
+            key_cols=extra_key_cols,
         )
         if not best_by_id:
-            return {"id_to_col": {}, "levels": []}
+            return {
+                "id_to_col": {},
+                "levels": [],
+                "by_horizon": False,
+                "by_weekday": by_weekday,
+            }
         id_to_col = {
             uid: f"{model_name}-{info['direction']}-{info['percentile']}"
             for uid, info in best_by_id.items()
         }
         levels = sorted({info["percentile"] for info in best_by_id.values()})
-        return {"id_to_col": id_to_col, "levels": levels}
+        return {
+            "id_to_col": id_to_col,
+            "levels": levels,
+            "by_horizon": False,
+            "by_weekday": by_weekday,
+        }
 
     def _apply_percentile_correction(
         self,
@@ -744,10 +859,15 @@ class AutoMLForecast:
         id_to_col: Dict[Any, str],
         time_col: Optional[str] = None,
         cutoff_col: Optional[str] = None,
+        by_horizon: bool = False,
+        by_weekday: bool = False,
     ) -> DataFrame:
         if not id_to_col:
             return preds
-        by_horizon = any(isinstance(k, tuple) and len(k) == 2 for k in id_to_col.keys())
+        if by_horizon and by_weekday:
+            raise ValueError(
+                "weekday-based percentile correction can't be combined with per_horizon correction."
+            )
         if by_horizon:
             if time_col is None:
                 raise ValueError("time_col is required for per-horizon correction.")
@@ -756,7 +876,17 @@ class AutoMLForecast:
             )
             ids = self._to_numpy(preds[id_col])
             steps = self._to_numpy(preds["_horizon"]).astype(int)
-            keys = np.array([(uid, step) for uid, step in zip(ids, steps)], dtype=object)
+            keys = [(uid, step) for uid, step in zip(ids, steps)]
+            selected_cols = np.array(
+                [id_to_col.get(key, "") for key in keys], dtype=object
+            )
+        elif by_weekday:
+            if time_col is None:
+                raise ValueError("time_col is required for weekday-based correction.")
+            preds = self._add_weekday_column(preds, time_col=time_col)
+            ids = self._to_numpy(preds[id_col])
+            weekdays = self._to_numpy(preds["_weekday"]).astype(int)
+            keys = [(uid, weekday) for uid, weekday in zip(ids, weekdays)]
             selected_cols = np.array(
                 [id_to_col.get(key, "") for key in keys], dtype=object
             )
@@ -775,6 +905,8 @@ class AutoMLForecast:
         preds = ufp.assign_columns(preds, model_col, corrected_preds)
         if by_horizon and "_horizon" in preds.columns:
             preds = ufp.drop_columns(preds, "_horizon")
+        if by_weekday and "_weekday" in preds.columns:
+            preds = ufp.drop_columns(preds, "_weekday")
         return preds
 
     def _seasonality_based_config(
@@ -945,6 +1077,7 @@ class AutoMLForecast:
         percentile_correction_metric_kwargs: Optional[Dict[str, Any]] = None,
         percentile_correction_strict_bias: bool = True,
         percentile_correction_per_horizon: bool = False,
+        percentile_correction_by_weekday: bool = False,
         compute_corrected_cv_metrics: bool = False,
     ) -> "AutoMLForecast":
         """Carry out the optimization process.
@@ -990,6 +1123,9 @@ class AutoMLForecast:
                 bias sign across all CV rows to set direction. Defaults to True.
             percentile_correction_per_horizon (bool): When using metric-based correction, select the
                 best percentile per id and per horizon step (1..h). Defaults to False.
+            percentile_correction_by_weekday (bool): Select correction percentiles by `(id, weekday)`
+                instead of by `id` over the full horizon. Weekdays follow pandas convention
+                `0=Monday, ..., 6=Sunday`. Defaults to False.
             compute_corrected_cv_metrics (bool): When using percentile correction, compute CV metrics
                 after applying the correction mapping. Defaults to False.
 
@@ -1139,6 +1275,7 @@ class AutoMLForecast:
                     cutoff_col="cutoff",
                     strict_bias=percentile_correction_strict_bias,
                     per_horizon=percentile_correction_per_horizon,
+                    by_weekday=percentile_correction_by_weekday,
                 )
                 if compute_corrected_cv_metrics:
                     correction = self.percentile_correction_[name]
@@ -1187,6 +1324,8 @@ class AutoMLForecast:
                             id_to_col=correction["id_to_col"],
                             time_col=time_col,
                             cutoff_col="cutoff",
+                            by_horizon=correction.get("by_horizon", False),
+                            by_weekday=correction.get("by_weekday", False),
                         )
                         errors = cv_df[name] - cv_df[target_col]
                         self.cv_metrics_corrected_[name] = {
@@ -1194,7 +1333,12 @@ class AutoMLForecast:
                             "bias": float(np.mean(errors)),
                         }
             else:
-                self.percentile_correction_[name] = {"id_to_col": {}, "levels": []}
+                self.percentile_correction_[name] = {
+                    "id_to_col": {},
+                    "levels": [],
+                    "by_horizon": False,
+                    "by_weekday": False,
+                }
         return self
 
     def predict(
@@ -1233,6 +1377,8 @@ class AutoMLForecast:
                     model_col=name,
                     id_to_col=correction.get("id_to_col", {}),
                     time_col=model.ts.time_col,
+                    by_horizon=correction.get("by_horizon", False),
+                    by_weekday=correction.get("by_weekday", False),
                 )
                 extra_levels = set(correction_levels)
                 if level is not None:
