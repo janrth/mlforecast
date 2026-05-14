@@ -46,7 +46,11 @@ from mlforecast.target_transforms import (
 from .compat import CatBoostRegressor
 from .grouped_array import GroupedArray
 from .lag_transforms import Lag, _BaseLagTransform
-from .pooled import PooledState, compute_pooled_features
+from .pooled import (
+    PooledState,
+    compute_global_features_by_time,
+    compute_pooled_features,
+)
 from .utils import (
     _DUMMY_FEATURE_VALUES,
     _ShortSeriesException,
@@ -618,6 +622,19 @@ class TimeSeries:
             for name in feature_cols:
                 features[name] = joined[name].to_numpy()
 
+    def _join_global_features_by_time(
+        self,
+        features: Dict[str, np.ndarray],
+        df: DFType,
+        state: PooledState,
+        vals_by_time: Dict[str, np.ndarray],
+    ) -> None:
+        unique_times = np.unique(state.time)
+        df_times = df[self.time_col].to_numpy()
+        ords = np.searchsorted(unique_times, df_times)
+        for name, vals in vals_by_time.items():
+            features[name] = vals[ords]
+
     def _compute_date_feature(self, dates, feature) -> Dict[str, Any]:
         """Compute date feature(s) and return as a ``{col_name: values}`` dict."""
         if (self.date_features_as_dummies
@@ -691,10 +708,22 @@ class TimeSeries:
         if global_tfms:
             assert self._pooled_global is not None
             state = self._pooled_global
-            bucket_vals = compute_pooled_features(state, global_tfms)
-            self._join_bucket_features(
-                features, df_sorted, state.bucket_df, bucket_vals, state.join_cols,
+            vals_by_time = compute_global_features_by_time(state, global_tfms)
+            self._join_global_features_by_time(
+                features, df_sorted, state, vals_by_time,
             )
+            slow_tfms = {
+                name: tfm for name, tfm in global_tfms.items() if name not in vals_by_time
+            }
+            if slow_tfms:
+                bucket_vals = compute_pooled_features(state, slow_tfms)
+                self._join_bucket_features(
+                    features,
+                    df_sorted,
+                    state.bucket_df,
+                    bucket_vals,
+                    state.join_cols,
+                )
         if group_tfms:
             for group_cols, tfms in group_tfms.items():
                 state = self._pooled_groups[group_cols]

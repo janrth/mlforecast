@@ -1,4 +1,8 @@
-__all__ = ["PooledState", "compute_pooled_features"]
+__all__ = [
+    "PooledState",
+    "compute_global_features_by_time",
+    "compute_pooled_features",
+]
 
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -9,7 +13,7 @@ import utilsforecast.processing as ufp
 from utilsforecast.compat import pl
 
 from .grouped_array import GroupedArray
-from .lag_transforms import _BaseLagTransform
+from .lag_transforms import RollingMean, _BaseLagTransform
 
 
 def _dedupe_preserve_order(items):
@@ -617,3 +621,50 @@ def compute_pooled_features(
             )
         bucket_vals[name] = computed
     return bucket_vals
+
+
+def _rolling_mean_from_aggs(
+    sums: np.ndarray,
+    counts: np.ndarray,
+    lag: int,
+    window_size: int,
+    min_samples: int,
+) -> np.ndarray:
+    csum = np.r_[0.0, np.cumsum(sums)]
+    ccount = np.r_[0.0, np.cumsum(counts)]
+    ords = np.arange(sums.size)
+    upper = ords - lag
+    lower = upper - window_size + 1
+    valid = upper >= 0
+    upper_clip = np.clip(upper, 0, sums.size - 1)
+    lower_clip = np.clip(lower, 0, sums.size)
+
+    window_sums = csum[upper_clip + 1] - csum[lower_clip]
+    window_counts = ccount[upper_clip + 1] - ccount[lower_clip]
+    out = np.full(sums.size, np.nan)
+    ok = valid & (window_counts >= min_samples) & (window_counts > 0)
+    out[ok] = window_sums[ok] / window_counts[ok]
+    return out
+
+
+def compute_global_features_by_time(
+    state: PooledState,
+    transforms: Dict[str, _BaseLagTransform],
+) -> Dict[str, np.ndarray]:
+    """Compute global RollingMean once per timestamp instead of once per row."""
+    if 0 not in state._ts_aggs:
+        return {}
+    agg = state._ts_aggs[0]
+    out: Dict[str, np.ndarray] = {}
+    for name, tfm in transforms.items():
+        if not isinstance(tfm, RollingMean):
+            continue
+        min_samples = tfm.min_samples if tfm.min_samples is not None else tfm.window_size
+        out[name] = _rolling_mean_from_aggs(
+            sums=agg.sums,
+            counts=agg.counts,
+            lag=tfm._core_tfm.lag,
+            window_size=tfm.window_size,
+            min_samples=min_samples,
+        )
+    return out
