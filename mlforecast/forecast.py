@@ -115,15 +115,21 @@ def _frozen_backtest(
 
     _original_ts = fcst.ts
     try:
-        static_cols = set(fcst.ts.static_features_.columns)
         dynamic_cols = [
             col
-            for col in fcst.ts.features_order_
-            if col in new_df.columns and col not in static_cols
+            for col in fcst.ts._get_dynamic_exog_cols(fcst.ts.features_order_)
+            if col in new_df.columns
         ]
-        partition_cols = sorted(
-            col for col in fcst.ts._partition_cols if col in new_df.columns
-        )
+        partition_cols = getattr(fcst.ts, "_partition_cols", None)
+        if partition_cols is None:
+            # Models saved before ``_partition_cols`` existed still retain
+            # partition metadata on their lag transforms.
+            partition_cols = {
+                col
+                for tfm in fcst.ts.transforms.values()
+                for col in (getattr(tfm, "partition_by", None) or [])
+            }
+        partition_cols = sorted(col for col in partition_cols if col in new_df.columns)
         future_cols = list(dict.fromkeys([*dynamic_cols, *partition_cols]))
         all_results = []
         splits = ufp.backtest_splits(
@@ -1647,12 +1653,16 @@ class MLForecast:
             _saved_source_scales = self._cs_source_scales_
             transfer_preprocess = None
             if spec.needs_preprocess:
+                # ``preprocess`` mutates ``self.ts``.  Run the target-domain
+                # preparation against an isolated copy so a failed DRE fit
+                # cannot replace the source forecasting state.
+                self.ts = copy.deepcopy(_saved_ts_for_cv)
                 transfer_preprocess = partial(
                     self.preprocess,
-                    id_col=self.ts.id_col,
-                    time_col=self.ts.time_col,
-                    target_col=self.ts.target_col,
-                    static_features=self.ts.static_features,
+                    id_col=_saved_ts_for_cv.id_col,
+                    time_col=_saved_ts_for_cv.time_col,
+                    target_col=_saved_ts_for_cv.target_col,
+                    static_features=_saved_ts_for_cv.static_features,
                 )
             try:
                 _transfer_result = spec.fn(
@@ -1706,6 +1716,15 @@ class MLForecast:
                     )
                     warnings.warn(warn_msg, UserWarning)
                 else:
+                    # Source-score transfer methods pool calibration rows from
+                    # the source domain, whose IDs need not exist in ``new_df``.
+                    # ``ts.predict`` above has already validated any requested
+                    # target IDs against the target forecasting state.
+                    is_transfer = (
+                        new_df is not None
+                        and transfer_conformal is not None
+                        and transfer_conformal.method != "recalibrate"
+                    )
                     cs_ids = set(
                         nw.from_native(self._cs_df, eager_only=True)[self.ts.id_col]
                         .unique()
@@ -1719,7 +1738,7 @@ class MLForecast:
                                 "than the current forecasting state. Please rerun `fit` before "
                                 "requesting intervals."
                             )
-                    else:
+                    elif not is_transfer:
                         missing_ids = set(ids) - cs_ids
                         if missing_ids:
                             raise ValueError(
@@ -1736,11 +1755,6 @@ class MLForecast:
                             "Please rerun the `fit` method passing a proper value "
                             "to prediction intervals."
                         )
-                    is_transfer = (
-                        new_df is not None
-                        and transfer_conformal is not None
-                        and transfer_conformal.method != "recalibrate"
-                    )
                     if self.prediction_intervals.h == 1 and h > 1:
                         if is_transfer:
                             raise ValueError(
@@ -1795,15 +1809,24 @@ class MLForecast:
                             "'weighted_conformal_distribution'."
                         )
                     if ids is not None:
-                        if _cs_weights is not None:
+                        if _cs_weights is not None and not is_transfer:
                             raise ValueError(
                                 "TransferConformal with DRE weights cannot be used together with "
                                 "ids= filtering: the weights array aligns with the full calibration "
                                 "set and would misalign after id-based filtering."
                             )
-                        ids_mask = ufp.is_in(self._cs_df[self.ts.id_col], ids)
-                        cs_df = ufp.filter_with_mask(self._cs_df, ids_mask)
-                        n_series = len(ids)
+                        if is_transfer:
+                            # Keep all pooled source calibration scores. Filtering
+                            # them by target IDs would discard every source row.
+                            cs_df = self._cs_df
+                            n_series = len(cs_df) // (
+                                self.prediction_intervals.n_windows
+                                * self.prediction_intervals.h
+                            )
+                        else:
+                            ids_mask = ufp.is_in(self._cs_df[self.ts.id_col], ids)
+                            cs_df = ufp.filter_with_mask(self._cs_df, ids_mask)
+                            n_series = len(ids)
                     else:
                         cs_df = self._cs_df
                         if is_transfer:
@@ -2120,7 +2143,12 @@ class MLForecast:
         if self._cs_df is not None:
             with fsspec.open(f"{path}/intervals.pkl", "wb") as f:
                 cloudpickle.dump(
-                    {"scores": self._cs_df, "settings": self.prediction_intervals}, f
+                    {
+                        "scores": self._cs_df,
+                        "settings": self.prediction_intervals,
+                        "source_scales": self._cs_source_scales_,
+                    },
+                    f,
                 )
 
     @staticmethod
@@ -2141,9 +2169,12 @@ class MLForecast:
         fcst = MLForecast(models=models, freq=ts.freq)
         fcst.ts = ts
         fcst.models_ = models
+        fcst._cs_df = None
+        fcst._cs_source_scales_ = None
         if intervals is not None:
             fcst.prediction_intervals = intervals["settings"]
             fcst._cs_df = intervals["scores"]
+            fcst._cs_source_scales_ = intervals.get("source_scales")
         return fcst
 
     def update(self, df: DataFrame, validate_new_data: bool = False) -> None:
